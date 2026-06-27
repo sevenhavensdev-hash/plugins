@@ -1,7 +1,7 @@
 import discord
 import aiohttp
 from discord.ext import commands
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 ROBLOX_USERS_API = "https://users.roblox.com/v1"
@@ -19,6 +19,31 @@ class RobloxMod(commands.Cog):
     async def get_config(self):
         doc = await self.db.find_one({"_id": "config"})
         return doc or {}
+
+    async def send_mod_log(self, ctx, action: str, user: dict, color: discord.Color, **kwargs):
+        config = await self.get_config()
+        log_channel_id = config.get("log_channel_id")
+        if not log_channel_id:
+            return
+
+        channel = ctx.guild.get_channel(int(log_channel_id))
+        if not channel:
+            return
+
+        user_id = user["id"]
+        now = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
+
+        embed = discord.Embed(title=f"Roblox Mod Log — {action}", color=color, timestamp=datetime.now(timezone.utc))
+        embed.set_author(name=str(ctx.author), icon_url=ctx.author.display_avatar.url)
+        embed.add_field(name="Roblox User", value=f"[@{user['name']}](https://www.roblox.com/users/{user_id}/profile) (`{user_id}`)", inline=True)
+        embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+
+        for key, value in kwargs.items():
+            embed.add_field(name=key, value=value, inline=False)
+
+        embed.add_field(name="Channel", value=ctx.channel.mention, inline=True)
+        embed.set_footer(text=f"Action performed on {now}")
+        await channel.send(embed=embed)
 
     async def resolve_user(self, session, identifier):
         if identifier.isdigit():
@@ -178,12 +203,18 @@ class RobloxMod(commands.Cog):
 
             async with session.patch(url, json=payload, headers=headers) as resp:
                 if resp.status in (200, 204):
+                    duration_display = duration if duration else "Permanent"
                     embed = discord.Embed(title="Roblox Ban Issued", color=discord.Color.red())
                     embed.add_field(name="User", value=f"@{user['name']} (`{user_id}`)", inline=True)
-                    embed.add_field(name="Duration", value=duration if duration else "Permanent", inline=True)
+                    embed.add_field(name="Duration", value=duration_display, inline=True)
                     embed.add_field(name="Reason", value=reason, inline=False)
                     embed.set_footer(text=f"Actioned by {ctx.author}")
                     await ctx.send(embed=embed)
+                    await self.send_mod_log(
+                        ctx, "Ban", user, discord.Color.red(),
+                        Reason=reason,
+                        Duration=duration_display
+                    )
                 else:
                     try:
                         error_data = await resp.json()
@@ -224,6 +255,9 @@ class RobloxMod(commands.Cog):
                     embed.add_field(name="User", value=f"@{user['name']} (`{user_id}`)", inline=True)
                     embed.set_footer(text=f"Actioned by {ctx.author}")
                     await ctx.send(embed=embed)
+                    await self.send_mod_log(
+                        ctx, "Unban", user, discord.Color.brand_green()
+                    )
                 else:
                     try:
                         error_data = await resp.json()
@@ -266,6 +300,10 @@ class RobloxMod(commands.Cog):
                     embed.add_field(name="Reason", value=reason, inline=False)
                     embed.set_footer(text=f"Actioned by {ctx.author} • Requires in-game handler")
                     await ctx.send(embed=embed)
+                    await self.send_mod_log(
+                        ctx, "Kick", user, discord.Color.orange(),
+                        Reason=reason
+                    )
                 else:
                     try:
                         error_data = await resp.json()
@@ -284,6 +322,8 @@ class RobloxMod(commands.Cog):
             value=(
                 "`robloxmod setkey <api_key>` — Set your Roblox Open Cloud API key\n"
                 "`robloxmod setuniverse <id>` — Set your Universe ID\n"
+                "`robloxmod setlogchannel <#channel>` — Set the mod log channel\n"
+                "`robloxmod removelogchannel` — Remove the mod log channel\n"
                 "`robloxmod config` — View current configuration"
             ),
             inline=False
@@ -316,16 +356,48 @@ class RobloxMod(commands.Cog):
         embed = discord.Embed(description=f"Universe ID set to `{universe_id}`.", color=discord.Color.brand_green())
         await ctx.send(embed=embed)
 
+    @robloxmod.command(name="setlogchannel")
+    @commands.has_permissions(administrator=True)
+    async def robloxmod_setlogchannel(self, ctx, channel: discord.TextChannel):
+        await self.db.find_one_and_update(
+            {"_id": "config"},
+            {"$set": {"log_channel_id": str(channel.id)}},
+            upsert=True
+        )
+        embed = discord.Embed(
+            description=f"Mod log channel set to {channel.mention}. All ban, unban, and kick actions will be logged there.",
+            color=discord.Color.brand_green()
+        )
+        await ctx.send(embed=embed)
+
+    @robloxmod.command(name="removelogchannel")
+    @commands.has_permissions(administrator=True)
+    async def robloxmod_removelogchannel(self, ctx):
+        await self.db.find_one_and_update(
+            {"_id": "config"},
+            {"$unset": {"log_channel_id": ""}},
+            upsert=True
+        )
+        embed = discord.Embed(description="Mod log channel has been removed.", color=discord.Color.orange())
+        await ctx.send(embed=embed)
+
     @robloxmod.command(name="config")
     @commands.has_permissions(administrator=True)
     async def robloxmod_config(self, ctx):
         config = await self.get_config()
         api_key = config.get("api_key")
         universe_id = config.get("universe_id")
+        log_channel_id = config.get("log_channel_id")
+
+        log_channel_display = "Not set"
+        if log_channel_id:
+            channel = ctx.guild.get_channel(int(log_channel_id))
+            log_channel_display = channel.mention if channel else f"Unknown channel (`{log_channel_id}`)"
 
         embed = discord.Embed(title="Roblox Mod — Current Configuration", color=discord.Color.blurple())
-        embed.add_field(name="API Key", value=f"||`{'*' * 12 + api_key[-4:] if api_key else 'Not set'}`||", inline=True)
+        embed.add_field(name="API Key", value=f"||`{'*' * 12 + api_key[-4:] if api_key else 'Not set'}`||", inline=False)
         embed.add_field(name="Universe ID", value=universe_id or "Not set", inline=True)
+        embed.add_field(name="Log Channel", value=log_channel_display, inline=True)
         await ctx.send(embed=embed)
 
 
