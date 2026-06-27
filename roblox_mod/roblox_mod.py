@@ -10,6 +10,18 @@ ROBLOX_BADGES_API = "https://badges.roblox.com/v1"
 ROBLOX_OPEN_CLOUD = "https://apis.roblox.com/cloud/v2"
 ROBLOX_MESSAGING = "https://apis.roblox.com/messaging-service/v1"
 
+ACTION_COLORS = {
+    "Ban": discord.Color.red(),
+    "Unban": discord.Color.brand_green(),
+    "Kick": discord.Color.orange(),
+}
+
+ACTION_ICONS = {
+    "Ban": "🔨",
+    "Unban": "✅",
+    "Kick": "👢",
+}
+
 
 class RobloxMod(commands.Cog):
     def __init__(self, bot):
@@ -19,6 +31,23 @@ class RobloxMod(commands.Cog):
     async def get_config(self):
         doc = await self.db.find_one({"_id": "config"})
         return doc or {}
+
+    async def store_mod_action(self, roblox_user_id: int, roblox_username: str, action: str, moderator: discord.Member, **kwargs):
+        entry = {
+            "action": action,
+            "moderator_id": str(moderator.id),
+            "moderator_tag": str(moderator),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        entry.update(kwargs)
+        await self.db.find_one_and_update(
+            {"_id": f"history_{roblox_user_id}"},
+            {
+                "$push": {"actions": entry},
+                "$set": {"roblox_username": roblox_username, "roblox_user_id": roblox_user_id},
+            },
+            upsert=True
+        )
 
     async def send_mod_log(self, ctx, action: str, user: dict, color: discord.Color, **kwargs):
         config = await self.get_config()
@@ -31,8 +60,6 @@ class RobloxMod(commands.Cog):
             return
 
         user_id = user["id"]
-        now = datetime.now(timezone.utc).strftime("%B %d, %Y at %H:%M UTC")
-
         embed = discord.Embed(title=f"Roblox Mod Log — {action}", color=color, timestamp=datetime.now(timezone.utc))
         embed.set_author(name=str(ctx.author), icon_url=ctx.author.display_avatar.url)
         embed.add_field(name="Roblox User", value=f"[@{user['name']}](https://www.roblox.com/users/{user_id}/profile) (`{user_id}`)", inline=True)
@@ -42,7 +69,6 @@ class RobloxMod(commands.Cog):
             embed.add_field(name=key, value=value, inline=False)
 
         embed.add_field(name="Channel", value=ctx.channel.mention, inline=True)
-        embed.set_footer(text=f"Action performed on {now}")
         await channel.send(embed=embed)
 
     async def resolve_user(self, session, identifier):
@@ -109,9 +135,17 @@ class RobloxMod(commands.Cog):
         except Exception:
             return iso_string or "Unknown"
 
-    @commands.command(name="rlookup")
+    def format_timestamp(self, iso_string):
+        try:
+            dt = datetime.fromisoformat(iso_string)
+            return f"<t:{int(dt.timestamp())}:R>"
+        except Exception:
+            return iso_string or "Unknown"
+
+    @commands.command(name="rlookup", usage="<username | id>")
     @commands.has_permissions(manage_messages=True)
     async def rlookup(self, ctx, identifier: str):
+        """Look up a Roblox user's profile, avatar, game badges, and ban status. Accepts a username or numeric user ID."""
         config = await self.get_config()
         api_key = config.get("api_key")
         universe_id = config.get("universe_id")
@@ -166,9 +200,10 @@ class RobloxMod(commands.Cog):
             embed.set_footer(text=f"Requested by {ctx.author} • Roblox ID: {user_id}")
             await ctx.send(embed=embed)
 
-    @commands.command(name="rban")
+    @commands.command(name="rban", usage="<username | id> [duration] <reason>")
     @commands.has_permissions(manage_messages=True)
     async def rban(self, ctx, identifier: str, duration: str = None, *, reason: str = "No reason provided."):
+        """Ban a player from your Roblox game. Duration is optional (e.g. 86400s for 24 hours) — omit it for a permanent ban."""
         config = await self.get_config()
         api_key = config.get("api_key")
         universe_id = config.get("universe_id")
@@ -210,11 +245,8 @@ class RobloxMod(commands.Cog):
                     embed.add_field(name="Reason", value=reason, inline=False)
                     embed.set_footer(text=f"Actioned by {ctx.author}")
                     await ctx.send(embed=embed)
-                    await self.send_mod_log(
-                        ctx, "Ban", user, discord.Color.red(),
-                        Reason=reason,
-                        Duration=duration_display
-                    )
+                    await self.send_mod_log(ctx, "Ban", user, discord.Color.red(), Reason=reason, Duration=duration_display)
+                    await self.store_mod_action(user_id, user["name"], "Ban", ctx.author, reason=reason, duration=duration_display)
                 else:
                     try:
                         error_data = await resp.json()
@@ -224,9 +256,10 @@ class RobloxMod(commands.Cog):
                     embed = discord.Embed(description=f"Failed to ban user: {msg}", color=discord.Color.red())
                     await ctx.send(embed=embed)
 
-    @commands.command(name="runban")
+    @commands.command(name="runban", usage="<username | id>")
     @commands.has_permissions(manage_messages=True)
     async def runban(self, ctx, identifier: str):
+        """Remove an active game ban for a Roblox player. The player will be able to rejoin immediately."""
         config = await self.get_config()
         api_key = config.get("api_key")
         universe_id = config.get("universe_id")
@@ -255,9 +288,8 @@ class RobloxMod(commands.Cog):
                     embed.add_field(name="User", value=f"@{user['name']} (`{user_id}`)", inline=True)
                     embed.set_footer(text=f"Actioned by {ctx.author}")
                     await ctx.send(embed=embed)
-                    await self.send_mod_log(
-                        ctx, "Unban", user, discord.Color.brand_green()
-                    )
+                    await self.send_mod_log(ctx, "Unban", user, discord.Color.brand_green())
+                    await self.store_mod_action(user_id, user["name"], "Unban", ctx.author)
                 else:
                     try:
                         error_data = await resp.json()
@@ -267,9 +299,10 @@ class RobloxMod(commands.Cog):
                     embed = discord.Embed(description=f"Failed to unban user: {msg}", color=discord.Color.red())
                     await ctx.send(embed=embed)
 
-    @commands.command(name="rkick")
+    @commands.command(name="rkick", usage="<username | id> <reason>")
     @commands.has_permissions(manage_messages=True)
     async def rkick(self, ctx, identifier: str, *, reason: str = "No reason provided."):
+        """Kick a player from all active servers in your Roblox game via the Messaging Service. Requires an in-game handler script."""
         config = await self.get_config()
         api_key = config.get("api_key")
         universe_id = config.get("universe_id")
@@ -300,10 +333,8 @@ class RobloxMod(commands.Cog):
                     embed.add_field(name="Reason", value=reason, inline=False)
                     embed.set_footer(text=f"Actioned by {ctx.author} • Requires in-game handler")
                     await ctx.send(embed=embed)
-                    await self.send_mod_log(
-                        ctx, "Kick", user, discord.Color.orange(),
-                        Reason=reason
-                    )
+                    await self.send_mod_log(ctx, "Kick", user, discord.Color.orange(), Reason=reason)
+                    await self.store_mod_action(user_id, user["name"], "Kick", ctx.author, reason=reason)
                 else:
                     try:
                         error_data = await resp.json()
@@ -313,9 +344,78 @@ class RobloxMod(commands.Cog):
                     embed = discord.Embed(description=f"Failed to kick user: {msg}", color=discord.Color.red())
                     await ctx.send(embed=embed)
 
-    @commands.group(name="robloxmod", invoke_without_command=True)
+    @commands.command(name="rhistory", usage="<username | id>")
+    @commands.has_permissions(manage_messages=True)
+    async def rhistory(self, ctx, identifier: str):
+        """View the full moderation history for a Roblox user — all bans, unbans, and kicks logged by this plugin."""
+        async with aiohttp.ClientSession() as session:
+            user = await self.resolve_user(session, identifier)
+            if not user:
+                embed = discord.Embed(description="No Roblox user was found with that username or ID.", color=discord.Color.red())
+                return await ctx.send(embed=embed)
+
+            user_id = user["id"]
+            avatar_url = await self.get_avatar_url(session, user_id)
+
+        record = await self.db.find_one({"_id": f"history_{user_id}"})
+
+        if not record or not record.get("actions"):
+            embed = discord.Embed(
+                description=f"No moderation history found for **@{user['name']}**.",
+                color=discord.Color.greyple()
+            )
+            embed.set_footer(text=f"Roblox ID: {user_id}")
+            return await ctx.send(embed=embed)
+
+        actions = list(reversed(record["actions"]))
+        total = len(actions)
+        shown = actions[:10]
+
+        ban_count = sum(1 for a in record["actions"] if a["action"] == "Ban")
+        unban_count = sum(1 for a in record["actions"] if a["action"] == "Unban")
+        kick_count = sum(1 for a in record["actions"] if a["action"] == "Kick")
+
+        embed = discord.Embed(
+            title=f"Moderation History — @{user['name']}",
+            url=f"https://www.roblox.com/users/{user_id}/profile",
+            color=discord.Color.blurple()
+        )
+        if avatar_url:
+            embed.set_thumbnail(url=avatar_url)
+
+        embed.add_field(name="User ID", value=str(user_id), inline=True)
+        embed.add_field(
+            name="Summary",
+            value=f"🔨 {ban_count} Ban{'s' if ban_count != 1 else ''}  •  ✅ {unban_count} Unban{'s' if unban_count != 1 else ''}  •  👢 {kick_count} Kick{'s' if kick_count != 1 else ''}",
+            inline=False
+        )
+
+        for entry in shown:
+            action = entry.get("action", "Unknown")
+            icon = ACTION_ICONS.get(action, "•")
+            moderator_tag = entry.get("moderator_tag", "Unknown")
+            timestamp = self.format_timestamp(entry.get("timestamp", ""))
+            reason = entry.get("reason", "")
+            duration = entry.get("duration", "")
+
+            lines = [f"**Moderator:** {moderator_tag}", f"**When:** {timestamp}"]
+            if reason:
+                lines.append(f"**Reason:** {reason}")
+            if duration and action == "Ban":
+                lines.append(f"**Duration:** {duration}")
+
+            embed.add_field(name=f"{icon} {action}", value="\n".join(lines), inline=False)
+
+        footer = f"Showing {len(shown)} of {total} total action{'s' if total != 1 else ''} • Roblox ID: {user_id}"
+        if total > 10:
+            footer = f"Showing 10 most recent of {total} total actions • Roblox ID: {user_id}"
+        embed.set_footer(text=footer)
+        await ctx.send(embed=embed)
+
+    @commands.group(name="robloxmod", invoke_without_command=True, usage="<subcommand>")
     @commands.has_permissions(administrator=True)
     async def robloxmod(self, ctx):
+        """Configure the Roblox Mod plugin — set your API key, Universe ID, and mod log channel."""
         embed = discord.Embed(title="Roblox Mod — Configuration", color=discord.Color.blurple())
         embed.add_field(
             name="Commands",
