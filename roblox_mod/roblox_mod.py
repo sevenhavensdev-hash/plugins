@@ -236,7 +236,7 @@ class RobloxMod(commands.Cog):
 
             payload = {"gameJoinRestriction": restriction}
 
-            async with session.patch(url, json=payload, headers=headers) as resp:
+            async with session.patch(url, json=payload, headers=headers, params={"updateMask": "gameJoinRestriction"}) as resp:
                 if resp.status in (200, 204):
                     duration_display = duration if duration else "Permanent"
                     embed = discord.Embed(title="Roblox Ban Issued", color=discord.Color.red())
@@ -282,7 +282,7 @@ class RobloxMod(commands.Cog):
             url = f"{ROBLOX_OPEN_CLOUD}/universes/{universe_id}/user-restrictions/{user_id}"
             payload = {"gameJoinRestriction": {"active": False}}
 
-            async with session.patch(url, json=payload, headers=headers) as resp:
+            async with session.patch(url, json=payload, headers=headers, params={"updateMask": "gameJoinRestriction"}) as resp:
                 if resp.status in (200, 204):
                     embed = discord.Embed(title="Roblox Ban Removed", color=discord.Color.brand_green())
                     embed.add_field(name="User", value=f"@{user['name']} (`{user_id}`)", inline=True)
@@ -323,7 +323,7 @@ class RobloxMod(commands.Cog):
             user_id = user["id"]
             headers = {"x-api-key": api_key, "Content-Type": "application/json"}
             topic = "RobloxModKick"
-            url = f"{ROBLOX_MESSAGING}/publish/topic/{topic}"
+            url = f"{ROBLOX_MESSAGING}/universes/{universe_id}/topics/{topic}"
             message_payload = {"message": f'{{"userId": {user_id}, "reason": "{reason}"}}'}
 
             async with session.post(url, json=message_payload, headers=headers) as resp:
