@@ -358,12 +358,17 @@ class RobloxMod(commands.Cog):
                     await self.send_mod_log(ctx, "Kick", user, discord.Color.orange(), Reason=reason)
                     await self.store_mod_action(user_id, user["name"], "Kick", ctx.author, reason=reason)
                 else:
+                    raw = await resp.text()
                     try:
-                        error_data = await resp.json()
-                        msg = error_data.get("message", "Unknown error.")
+                        import json as _json
+                        error_data = _json.loads(raw)
+                        msg = error_data.get("message") or error_data.get("error") or raw
                     except Exception:
-                        msg = f"HTTP {resp.status}"
-                    embed = discord.Embed(description=f"Failed to kick user: {msg}", color=discord.Color.red())
+                        msg = raw or f"HTTP {resp.status}"
+                    embed = discord.Embed(
+                        description=f"Failed to kick user (`HTTP {resp.status}`):\n```{msg[:1000]}```",
+                        color=discord.Color.red()
+                    )
                     await ctx.send(embed=embed)
 
     @commands.command(name="rhistory", usage="<username | id>")
