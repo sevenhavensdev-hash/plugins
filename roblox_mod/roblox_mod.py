@@ -8,7 +8,6 @@ ROBLOX_USERS_API = "https://users.roblox.com/v1"
 ROBLOX_THUMBNAILS_API = "https://thumbnails.roblox.com/v1"
 ROBLOX_BADGES_API = "https://badges.roblox.com/v1"
 ROBLOX_OPEN_CLOUD = "https://apis.roblox.com/cloud/v2"
-ROBLOX_MESSAGING = "https://apis.roblox.com/messaging-service/v1"
 
 ACTION_COLORS = {
     "Ban": discord.Color.red(),
@@ -324,7 +323,7 @@ class RobloxMod(commands.Cog):
     @commands.command(name="rkick", usage="<username | id> <reason>")
     @commands.has_permissions(manage_messages=True)
     async def rkick(self, ctx, identifier: str, *, reason: str = "No reason provided."):
-        """Kick a player from all active servers in your Roblox game via the Messaging Service. Requires an in-game handler script."""
+        """Kick a player from your Roblox game. Issues a 1-second ban which immediately removes them from any active server, then expires automatically."""
         config = await self.get_config()
         api_key = config.get("api_key")
         universe_id = config.get("universe_id")
@@ -344,16 +343,26 @@ class RobloxMod(commands.Cog):
 
             user_id = user["id"]
             headers = {"x-api-key": api_key, "Content-Type": "application/json"}
-            topic = "RobloxModKick"
-            url = f"{ROBLOX_MESSAGING}/universes/{universe_id}/topics/{topic}"
-            message_payload = {"message": f'{{"userId": {user_id}, "reason": "{reason}"}}'}
+            url = f"{ROBLOX_OPEN_CLOUD}/universes/{universe_id}/user-restrictions/{user_id}"
+            payload = {
+                "gameJoinRestriction": {
+                    "active": True,
+                    "duration": "1s",
+                    "privateReason": f"[KICK] {reason}",
+                    "displayReason": reason,
+                    "excludeAltAccounts": False,
+                }
+            }
 
-            async with session.post(url, json=message_payload, headers=headers) as resp:
+            async with session.patch(
+                url, json=payload, headers=headers,
+                params={"updateMask": "game_join_restriction"}
+            ) as resp:
                 if resp.status in (200, 204):
                     embed = discord.Embed(title="Roblox Kick Issued", color=discord.Color.orange())
                     embed.add_field(name="User", value=f"@{user['name']} (`{user_id}`)", inline=True)
                     embed.add_field(name="Reason", value=reason, inline=False)
-                    embed.set_footer(text=f"Actioned by {ctx.author} • Requires in-game handler")
+                    embed.set_footer(text=f"Actioned by {ctx.author}")
                     await ctx.send(embed=embed)
                     await self.send_mod_log(ctx, "Kick", user, discord.Color.orange(), Reason=reason)
                     await self.store_mod_action(user_id, user["name"], "Kick", ctx.author, reason=reason)
