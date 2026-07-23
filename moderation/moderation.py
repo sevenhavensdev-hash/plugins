@@ -5,8 +5,6 @@ Warns, mutes, bans, softbans, kicks, mod logging,
 staff statistics, leaderboard, promotions and demotions.
 """
 
-from __future__ import annotations
-
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
@@ -243,10 +241,10 @@ class Moderation(commands.Cog):
             appeal_val = "No"
 
         embed = discord.Embed(color=color, timestamp=datetime.now(timezone.utc))
-        embed.set_author(
-            name=f"Case #{case}  ·  {label}",
-            icon_url=(ctx.guild.icon.url if ctx.guild.icon else discord.utils.MISSING),
-        )
+        author_kwargs = {"name": f"Case #{case}  ·  {label}"}
+        if ctx.guild.icon:
+            author_kwargs["icon_url"] = ctx.guild.icon.url
+        embed.set_author(**author_kwargs)
         embed.set_thumbnail(url=target.display_avatar.url)
 
         embed.add_field(name="User ID & Username",  value=f"`{target.id}` / {target}",   inline=False)
@@ -859,10 +857,10 @@ class Moderation(commands.Cog):
             color=color,
             timestamp=datetime.now(timezone.utc),
         )
-        embed.set_author(
-            name=f"{arrow} Staff {label}",
-            icon_url=(ctx.guild.icon.url if ctx.guild.icon else discord.utils.MISSING),
-        )
+        staff_author_kwargs = {"name": f"{arrow} Staff {label}"}
+        if ctx.guild.icon:
+            staff_author_kwargs["icon_url"] = ctx.guild.icon.url
+        embed.set_author(**staff_author_kwargs)
         embed.set_thumbnail(url=member.display_avatar.url)
         embed.add_field(name="User ID & Username", value=f"`{member.id}` / {member}", inline=False)
         embed.add_field(name=label,                value=f"{arrow} {verb} **{role.name}**",  inline=False)
