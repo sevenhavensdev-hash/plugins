@@ -1559,13 +1559,16 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"`{prefix}modstaff setcolor <action> <hex>` — Set embed color for an action\n"
                 f"`{prefix}modstaff setstaffrole <@role>` — Add/remove a staff role\n"
                 f"`{prefix}modstaff setmanager <@role>` — Add/remove a manager role\n"
+                f"`{prefix}modstaff setteamrole [@role]` — Set/clear the global staff team role\n"
                 f"`{prefix}modstaff setrankorder [@role1 @role2 ...]` — Set/view rank ladder (low → high)\n"
                 f"`{prefix}modstaff clearrankorder` — Remove the rank ladder\n"
                 f"`{prefix}modstaff setranktier @rank [@perk1 ...]` — Attach perk roles (LR/MR/dept) to a rank\n"
                 f"`{prefix}modstaff clearranktier @rank` — Remove perk roles from a rank\n"
                 f"`{prefix}modstaff showranktiers` — Show all configured rank tier perks\n"
                 f"`{prefix}modstaff showconfig` — Show current plugin configuration\n"
-                f"`{prefix}modstaff help` — Show this message"
+                f"`{prefix}modstaff help` — Show this message\n\n"
+                f"**Per-member commands:**\n"
+                f"`{prefix}setdept @user [@role] [reason]` — Assign or remove a member's department role"
             ),
             inline=False,
         )
@@ -1889,6 +1892,130 @@ class ModStaff(commands.Cog, name="ModStaff"):
             )
         )
 
+    # ===========================================================================
+    # setdept — per-member department role command
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.command(name="setdept")
+    async def setdept(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        role: Optional[discord.Role] = None,
+        *,
+        reason: str = "No reason provided.",
+    ):
+        """
+        Assign or remove a department role for a specific staff member.
+
+        Usage:
+          `?setdept @user @DeptRole [reason]` — assign a department role
+          `?setdept @user` (no role) — remove their current department role
+
+        The department role is stored per-person and is automatically removed
+        on `?termination` along with all other staff roles.
+        Requires ADMINISTRATOR permission level or a configured manager role.
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        manager_roles = cfg.get("manager_role_ids", [])
+        if manager_roles:
+            if not await self._check_role_permission(ctx, manager_roles):
+                return await ctx.send(
+                    embed=error_embed(
+                        "Insufficient Permissions",
+                        "You need a configured manager role to use this command.",
+                    )
+                )
+
+        staff_doc = await self._get_staff_doc(ctx.guild.id, member.id)
+        current_dept_id = staff_doc.get("dept_role_id")
+        current_dept = ctx.guild.get_role(int(current_dept_id)) if current_dept_id else None
+
+        # No role provided — remove current department role
+        if role is None:
+            if not current_dept:
+                return await ctx.send(
+                    embed=error_embed(
+                        "No Department Role",
+                        f"{member.mention} does not have a department role assigned.",
+                    )
+                )
+
+            try:
+                await member.remove_roles(current_dept, reason=f"[Dept Removed] {reason} | Mod: {ctx.author}")
+            except discord.Forbidden:
+                return await ctx.send(
+                    embed=error_embed("Missing Permissions", "I cannot remove roles from this member.")
+                )
+            except discord.HTTPException as e:
+                return await ctx.send(embed=error_embed("Discord Error", str(e)))
+
+            await self.db.find_one_and_update(
+                {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+                {"$set": {"dept_role_id": None}},
+                upsert=True,
+            )
+
+            embed = success_embed(
+                "Department Role Removed",
+                f"Removed {current_dept.mention} from {member.mention}.\n**Reason:** {reason}",
+            )
+            await ctx.send(embed=embed)
+            await self._send_log(ctx.guild, discord.Embed(
+                title="🏢 Department Role Removed",
+                description=(
+                    f"**Member:** {member.mention} (`{member.id}`)\n"
+                    f"**Role Removed:** {current_dept.mention}\n"
+                    f"**By:** {ctx.author.mention}\n"
+                    f"**Reason:** {reason}"
+                ),
+                color=COLORS.get("demote", 0xFF4444),
+                timestamp=datetime.now(tz=timezone.utc),
+            ))
+            return
+
+        # Role provided — assign new department role
+        # Remove old dept role first if different
+        if current_dept and current_dept != role:
+            try:
+                await member.remove_roles(current_dept, reason="Department role replaced")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                logger.warning("Could not remove old dept role for %s: %s", member.id, e)
+
+        try:
+            await member.add_roles(role, reason=f"[Dept Assigned] {reason} | Mod: {ctx.author}")
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I cannot assign that role to this member.")
+            )
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
+
+        await self.db.find_one_and_update(
+            {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+            {"$set": {"dept_role_id": str(role.id)}},
+            upsert=True,
+        )
+
+        desc = f"Assigned {role.mention} to {member.mention} as their department role.\n**Reason:** {reason}"
+        if current_dept and current_dept != role:
+            desc += f"\n*(Replaced previous: {current_dept.mention})*"
+
+        embed = success_embed("Department Role Set", desc)
+        await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, discord.Embed(
+            title="🏢 Department Role Assigned",
+            description=(
+                f"**Member:** {member.mention} (`{member.id}`)\n"
+                f"**Role:** {role.mention}\n"
+                f"**By:** {ctx.author.mention}\n"
+                f"**Reason:** {reason}"
+            ),
+            color=COLORS.get("promote", 0x57F287),
+            timestamp=datetime.now(tz=timezone.utc),
+        ))
+
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @modstaff_group.command(name="showranktiers")
     async def showranktiers(self, ctx: commands.Context):
@@ -1955,6 +2082,9 @@ class ModStaff(commands.Cog, name="ModStaff"):
             f"<@&{r}>" for r in manager_role_ids
         ) or "None configured (uses ADMINISTRATOR level)"
 
+        team_role_id = cfg.get("staff_team_role_id")
+        team_role_display = f"<@&{team_role_id}>" if team_role_id else "Not set"
+
         embed = discord.Embed(
             title="⚙️ ModStaff Configuration",
             color=COLORS["config"],
@@ -1962,6 +2092,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         embed.add_field(name="📋 Log Channel", value=log_ch, inline=False)
         embed.add_field(name="👥 Staff Roles", value=staff_roles, inline=False)
         embed.add_field(name="🔑 Manager Roles", value=manager_roles, inline=False)
+        embed.add_field(name="🏷️ Staff Team Role", value=team_role_display, inline=False)
 
         rank_order = cfg.get("rank_order", [])
         if rank_order:
