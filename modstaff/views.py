@@ -112,10 +112,26 @@ class ModStaff(commands.Cog, name="ModStaff"):
     async def _bump_staff_stat(
         self, guild_id: int, moderator_id: int, action: str
     ):
-        """Increment a moderation stat counter for a staff member."""
+        """
+        Increment a moderation stat counter for a staff member.
+
+        last_active is written to BOTH staff_stats and staff_data so that
+        whichever document the stats embed reads from, the value is current.
+        """
+        now = time.time()
+        # Primary stats document
         await self.db.find_one_and_update(
             {"type": "staff_stats", "guild_id": str(guild_id), "user_id": str(moderator_id)},
-            {"$inc": {f"moderation.{action}": 1}, "$set": {"last_active": time.time()}},
+            {
+                "$inc": {f"moderation.{action}": 1},
+                "$set": {"last_active": now},
+            },
+            upsert=True,
+        )
+        # Mirror last_active into staff_data so the embed always has it
+        await self.db.find_one_and_update(
+            {"type": "staff_data", "guild_id": str(guild_id), "user_id": str(moderator_id)},
+            {"$set": {"last_active": now}},
             upsert=True,
         )
 
@@ -227,6 +243,64 @@ class ModStaff(commands.Cog, name="ModStaff"):
             return True
         except (discord.Forbidden, discord.HTTPException):
             return False
+
+    async def _is_staff_member(self, guild_id: int, member: discord.Member) -> bool:
+        """Return True if the member holds any configured staff role."""
+        cfg = await self._get_config(guild_id)
+        staff_role_ids = cfg.get("staff_role_ids", [])
+        if not staff_role_ids:
+            return False
+        member_role_ids = {str(r.id) for r in member.roles}
+        return bool(member_role_ids.intersection(staff_role_ids))
+
+    # ===========================================================================
+    # Message tracking listener
+    # ===========================================================================
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """
+        Track messages sent by staff members in guild channels.
+
+        Increments tickets.messages_sent in staff_stats for every non-bot
+        message a staff member sends in a guild text channel or thread.
+        This powers the 'Messages Sent' counter shown in ?staffstats.
+        """
+        # Ignore DMs, bots, and system messages
+        if not message.guild or message.author.bot or not message.content:
+            return
+
+        member = message.guild.get_member(message.author.id)
+        if member is None:
+            return
+
+        # Only track messages from configured staff members
+        if not await self._is_staff_member(message.guild.id, member):
+            return
+
+        now = time.time()
+        await self.db.find_one_and_update(
+            {
+                "type": "staff_stats",
+                "guild_id": str(message.guild.id),
+                "user_id": str(message.author.id),
+            },
+            {
+                "$inc": {"tickets.messages_sent": 1},
+                "$set": {"last_active": now},
+            },
+            upsert=True,
+        )
+        # Mirror last_active to staff_data too
+        await self.db.find_one_and_update(
+            {
+                "type": "staff_data",
+                "guild_id": str(message.guild.id),
+                "user_id": str(message.author.id),
+            },
+            {"$set": {"last_active": now}},
+            upsert=True,
+        )
 
     # ===========================================================================
     # Moderation commands
@@ -429,7 +503,6 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "kick")
 
         embed = action_embed("kick", ctx.author, member, reason, case_id, guild_name=ctx.guild.name)
-        # Patch the DM embed's case id (was 0 before we had the case id)
         await ctx.send(embed=embed)
         await self._send_log(ctx.guild, embed)
 
@@ -728,6 +801,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         Usage: `?promote @user @role [reason]`
 
+        If staff roles are configured, the target role must be one of them.
         Requires ADMINISTRATOR permission level or a configured manager role.
         """
         cfg = await self._get_config(ctx.guild.id)
@@ -741,15 +815,16 @@ class ModStaff(commands.Cog, name="ModStaff"):
                     )
                 )
 
-        # Restrict promote to configured staff roles only
+        # Only enforce the staff-role whitelist when it has been configured.
+        # This allows promote to work freely until the server admin sets it up.
         staff_role_ids = cfg.get("staff_role_ids", [])
         if staff_role_ids and str(role.id) not in staff_role_ids:
             return await ctx.send(
                 embed=error_embed(
                     "Not a Staff Role",
-                    f"{role.mention} is not a configured staff role.\n"
-                    f"Add it first with `{ctx.prefix}modstaff setstaffrole {role.mention}`, "
-                    f"or choose a role that is already configured.",
+                    f"{role.mention} is not in the configured staff role list.\n"
+                    f"Add it with `{ctx.prefix}modstaff setstaffrole {role.mention}` first, "
+                    f"or leave staff roles unconfigured to allow any role.",
                 )
             )
 
@@ -802,13 +877,20 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         now_ts = time.time()
 
-        # Record promotion in database
+        # Update staff_data.
+        # IMPORTANT: $setOnInsert only fires when the document is first created.
+        # This means staff_since is preserved for existing staff members (re-promotions,
+        # rank changes) — only set on their very first promotion.
+        # We also store last_active here so the embed always has it regardless of
+        # which document the stats embed reads from.
         await self.db.find_one_and_update(
             {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
             {
                 "$set": {
                     "current_rank": role.name,
+                    "current_rank_id": str(role.id),
                     "rank_since": now_ts,
+                    "last_active": now_ts,
                 },
                 "$setOnInsert": {"staff_since": now_ts},
                 "$push": {
@@ -823,7 +905,18 @@ class ModStaff(commands.Cog, name="ModStaff"):
             },
             upsert=True,
         )
+
+        # Update stats for the PROMOTER (their "promotions performed" count).
+        # The PROMOTEE's own moderation stats are untouched — nothing resets.
         await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "promote")
+
+        # Also touch the promotee's staff_stats last_active so their profile
+        # is marked as recently active.
+        await self.db.find_one_and_update(
+            {"type": "staff_stats", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+            {"$set": {"last_active": now_ts}},
+            upsert=True,
+        )
 
         case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "promote", reason)
 
@@ -940,6 +1033,9 @@ class ModStaff(commands.Cog, name="ModStaff"):
             {
                 "$set": {
                     "current_rank": replacement_role.name if replacement_role else "None",
+                    "current_rank_id": str(replacement_role.id) if replacement_role else None,
+                    "rank_since": now_ts,
+                    "last_active": now_ts,
                 },
                 "$push": {
                     "demotions": {
@@ -1080,7 +1176,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await self.db.find_one_and_update(
             {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
             {
-                "$set": {"current_rank": "Terminated"},
+                "$set": {"current_rank": "Terminated", "current_rank_id": None, "last_active": now_ts},
                 "$push": {
                     "demotions": {
                         "role_removed": "ALL STAFF ROLES",
@@ -1152,11 +1248,20 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         Usage: `?staffstats [@user]`
         Defaults to the command author if no user is specified.
+
+        Shows current rank, time in rank, staff since, last active,
+        tickets handled, messages sent, moderation action counts,
+        and full role promotion/demotion history.
         """
         target = member or ctx.author
 
         staff_doc = await self._get_staff_doc(ctx.guild.id, target.id)
         stats_doc = await self._get_stats_doc(ctx.guild.id, target.id)
+
+        # Merge last_active: prefer staff_stats (most up-to-date), fall back to staff_data
+        if not stats_doc.get("last_active") and staff_doc.get("last_active"):
+            stats_doc = dict(stats_doc)
+            stats_doc["last_active"] = staff_doc["last_active"]
 
         embed = stats_embed(target, ctx.guild, staff_doc, stats_doc)
         await ctx.send(embed=embed)
@@ -1176,8 +1281,6 @@ class ModStaff(commands.Cog, name="ModStaff"):
         docs = await cursor.to_list(length=None)
 
         entries = []
-        now = time.time()
-        month_start = now - 30 * 86400  # last 30 days approximation
 
         for doc in docs:
             m = doc.get("moderation", {})
@@ -1197,10 +1300,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
             elif category == "messages":
                 score = t.get("messages_sent", 0)
             elif category == "monthly":
-                # For monthly, we sum actions from the last 30 days using case records
-                # This is an approximation using stored data; a full monthly breakdown
-                # would require per-timestamp indexes.
-                score = mod_total  # fallback — monthly tracking requires extra collection
+                score = mod_total  # fallback — full monthly tracking requires per-timestamp indexing
             else:
                 score = 0
 
@@ -1230,7 +1330,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         Display the interactive staff leaderboard.
 
-        Navigate between categories (Overall, Tickets, Moderation, Monthly)
+        Navigate between categories (Overall, Tickets, Moderation, Messages)
         and pages using the buttons below the embed.
 
         Usage: `?staffleaderboard`
@@ -1262,7 +1362,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         ModStaff plugin configuration.
 
         Run `?modstaff` to see this help message.
-        Subcommands: setlog, setcolor, setstaffrole, setmanager, help
+        Subcommands: setlog, setcolor, setstaffrole, setmanager, setrankorder, showconfig, help
         """
         prefix = ctx.prefix
         embed = discord.Embed(
@@ -1422,7 +1522,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         staff_role_ids = cfg.get("staff_role_ids", [])
         staff_roles = ", ".join(
             f"<@&{r}>" for r in staff_role_ids
-        ) or "None configured"
+        ) or "None configured (any role can be used in ?promote)"
 
         manager_role_ids = cfg.get("manager_role_ids", [])
         manager_roles = ", ".join(
