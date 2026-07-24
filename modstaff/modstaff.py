@@ -887,7 +887,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         cfg = await self._get_config(ctx.guild.id)
         manager_roles = cfg.get("manager_role_ids", [])
-        if manager_roles:
+        is_admin = ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator
+        if manager_roles and not is_admin:
             if not await self._check_role_permission(ctx, manager_roles):
                 return await ctx.send(
                     embed=error_embed(
@@ -1109,7 +1110,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         cfg = await self._get_config(ctx.guild.id)
         manager_roles = cfg.get("manager_role_ids", [])
-        if manager_roles:
+        is_admin = ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator
+        if manager_roles and not is_admin:
             if not await self._check_role_permission(ctx, manager_roles):
                 return await ctx.send(
                     embed=error_embed(
@@ -1277,7 +1279,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         cfg = await self._get_config(ctx.guild.id)
         manager_roles = cfg.get("manager_role_ids", [])
-        if manager_roles:
+        is_admin = ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator
+        if manager_roles and not is_admin:
             if not await self._check_role_permission(ctx, manager_roles):
                 return await ctx.send(
                     embed=error_embed(
@@ -1919,7 +1922,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         cfg = await self._get_config(ctx.guild.id)
         manager_roles = cfg.get("manager_role_ids", [])
-        if manager_roles:
+        is_admin = ctx.author.id == ctx.guild.owner_id or ctx.author.guild_permissions.administrator
+        if manager_roles and not is_admin:
             if not await self._check_role_permission(ctx, manager_roles):
                 return await ctx.send(
                     embed=error_embed(
