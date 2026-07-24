@@ -542,7 +542,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await self._send_log(ctx.guild, embed)
 
     @checks.has_permissions(PermissionLevel.MODERATOR)
-    @commands.command(name="note")
+    @commands.command(name="addnote", aliases=["staffnote", "snote"])
     async def note(
         self,
         ctx: commands.Context,
@@ -553,7 +553,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         Add a staff-only note to a user's moderation history.
 
-        Usage: `?note @user <note text>`
+        Usage: `?addnote @user <note text>`
+        Aliases: staffnote, snote
         """
         case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "note", note)
         await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "note")
