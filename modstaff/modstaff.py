@@ -15,6 +15,7 @@ Plugin structure follows the official Modmail plugin API exactly:
 from __future__ import annotations
 
 import math
+import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
@@ -1488,9 +1489,12 @@ class ModStaff(commands.Cog, name="ModStaff"):
         Run with no roles mentioned to view the current ladder.
         Use `?modstaff clearrankorder` to remove the ladder entirely.
         """
-        # Use message.role_mentions so multi-word role names work correctly.
-        # discord.py splits *args on spaces, breaking roles like "Senior Moderator".
-        roles = ctx.message.role_mentions
+        # Parse role IDs from message content in the order they were typed.
+        # ctx.message.role_mentions is unordered (sorted by hierarchy), so we
+        # extract <@&ID> tokens ourselves to preserve the user's intended order.
+        mention_ids = re.findall(r"<@&(\d+)>", ctx.message.content)
+        role_map = {str(r.id): r for r in ctx.message.role_mentions}
+        roles = [role_map[rid] for rid in mention_ids if rid in role_map]
 
         if not roles:
             # Show current rank order instead of erroring
