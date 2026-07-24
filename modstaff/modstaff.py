@@ -1472,23 +1472,28 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @modstaff_group.command(name="setrankorder")
-    async def setrankorder(self, ctx: commands.Context, *roles: discord.Role):
+    async def setrankorder(self, ctx: commands.Context):
         """
         Set the staff rank ladder used for automatic demotion role assignment.
 
-        Provide roles in order from LOWEST to HIGHEST rank.
+        @mention roles in the message in order from LOWEST to HIGHEST rank.
 
         Usage: `?modstaff setrankorder @TrialMod @Moderator @SeniorMod @Admin`
 
+        Works with roles that have spaces in their names.
         When `?demote` is used and no replacement role is specified, the plugin
         will automatically assign the next lower role in this ladder.
         Example: demoting a Senior Moderator → automatically assigns Moderator.
 
-        Run with no roles to view the current ladder.
+        Run with no roles mentioned to view the current ladder.
         Use `?modstaff clearrankorder` to remove the ladder entirely.
         """
+        # Use message.role_mentions so multi-word role names work correctly.
+        # discord.py splits *args on spaces, breaking roles like "Senior Moderator".
+        roles = ctx.message.role_mentions
+
         if not roles:
-            # Show current rank order instead of clearing
+            # Show current rank order instead of erroring
             cfg = await self._get_config(ctx.guild.id)
             rank_order = cfg.get("rank_order", [])
             if not rank_order:
@@ -1510,7 +1515,9 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 description=f"**Order (lowest → highest):**\n{ladder_display}",
                 color=COLORS.get("config", 0x5865F2),
             )
-            embed.set_footer(text=f"To change: {ctx.prefix}modstaff setrankorder @role1 @role2 ... | To clear: {ctx.prefix}modstaff clearrankorder")
+            embed.set_footer(
+                text=f"To change: {ctx.prefix}modstaff setrankorder @role1 @role2 ... | To clear: {ctx.prefix}modstaff clearrankorder"
+            )
             return await ctx.send(embed=embed)
 
         role_ids = [str(r.id) for r in roles]
@@ -1527,7 +1534,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
             ),
             color=COLORS.get("success", 0x57F287),
         )
-        embed.set_footer(text="Use ?demote @user @role — the lower role is assigned automatically.")
+        embed.set_footer(text=f"Use {ctx.prefix}demote @user @role — the lower role is assigned automatically.")
         await ctx.send(embed=embed)
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
