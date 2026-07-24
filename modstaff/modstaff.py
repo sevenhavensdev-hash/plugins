@@ -1036,10 +1036,24 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "promote", reason)
 
+        # Add staff team role if configured and member doesn't already have it
+        team_role_id = cfg.get("staff_team_role_id")
+        team_role_added = False
+        if team_role_id:
+            team_role = ctx.guild.get_role(int(team_role_id))
+            if team_role and team_role not in member.roles:
+                try:
+                    await member.add_roles(team_role, reason="Staff team role — promotion")
+                    team_role_added = True
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    logger.warning("Could not add staff team role: %s", e)
+
         promote_extra = [
             ("🏅 New Role", role.mention, True),
             ("📅 Promoted At", format_dt_long(now_ts), True),
         ]
+        if team_role_added and team_role:
+            promote_extra.append(("👥 Team Role", team_role.mention, True))
         if perks_added:
             promote_extra.append(("➕ Perks Added", " ".join(r.mention for r in perks_added), False))
         if perks_removed:
@@ -1283,10 +1297,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 )
             )
 
-        roles_to_remove = [
-            r for r in member.roles
-            if str(r.id) in staff_role_ids
-        ]
+        roles_to_remove = [r for r in member.roles if str(r.id) in staff_role_ids]
 
         if not roles_to_remove:
             return await ctx.send(
@@ -1296,7 +1307,23 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 )
             )
 
-        roles_list = ", ".join(f"**{r.name}**" for r in roles_to_remove)
+        # Also collect team role and department role for removal
+        extra_remove: list[discord.Role] = []
+
+        team_role_id = cfg.get("staff_team_role_id")
+        team_role = ctx.guild.get_role(int(team_role_id)) if team_role_id else None
+        if team_role and team_role in member.roles:
+            extra_remove.append(team_role)
+
+        # Fetch stored department role from staff_data
+        staff_doc = await self._get_staff_doc(ctx.guild.id, member.id)
+        dept_role_id = staff_doc.get("dept_role_id")
+        dept_role = ctx.guild.get_role(int(dept_role_id)) if dept_role_id else None
+        if dept_role and dept_role in member.roles and dept_role not in extra_remove:
+            extra_remove.append(dept_role)
+
+        all_roles_to_remove = roles_to_remove + [r for r in extra_remove if r not in roles_to_remove]
+        roles_list = ", ".join(f"**{r.name}**" for r in all_roles_to_remove)
 
         confirm_embed = discord.Embed(
             title="🚫 Confirm Staff Termination",
@@ -1304,7 +1331,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"You are about to **terminate** {member.mention}.\n\n"
                 f"**Roles to be removed:**\n{roles_list}\n\n"
                 f"**Reason:** {reason}\n\n"
-                "⚠️ This will remove **all** staff roles from this member."
+                "⚠️ This will remove all staff, team, and department roles."
             ),
             color=COLORS["termination"],
         )
@@ -1322,7 +1349,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
             return await msg.edit(embed=error_embed("Cancelled", "Termination cancelled."), view=view)
 
         try:
-            await member.remove_roles(*roles_to_remove, reason=f"[Termination] {reason} | Mod: {ctx.author}")
+            await member.remove_roles(*all_roles_to_remove, reason=f"[Termination] {reason} | Mod: {ctx.author}")
         except discord.Forbidden:
             return await msg.edit(
                 embed=error_embed("Missing Permissions", "I cannot remove roles from this member."),
@@ -1333,15 +1360,20 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         now_ts = time.time()
 
-        # Record in staff_data
+        # Clear stored dept role and update rank in staff_data
         await self.db.find_one_and_update(
             {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
             {
-                "$set": {"current_rank": "Terminated", "current_rank_id": None, "last_active": now_ts},
+                "$set": {
+                    "current_rank": "Terminated",
+                    "current_rank_id": None,
+                    "dept_role_id": None,
+                    "last_active": now_ts,
+                },
                 "$push": {
                     "demotions": {
                         "role_removed": "ALL STAFF ROLES",
-                        "roles": [str(r.id) for r in roles_to_remove],
+                        "roles": [str(r.id) for r in all_roles_to_remove],
                         "replacement": None,
                         "demoted_by": str(ctx.author.id),
                         "reason": f"[TERMINATION] {reason}",
@@ -1362,18 +1394,10 @@ class ModStaff(commands.Cog, name="ModStaff"):
             color=COLORS["termination"],
             timestamp=datetime.now(tz=timezone.utc),
         )
-        result_embed.add_field(
-            name="👤 Member", value=f"{member.mention} (`{member.id}`)", inline=True
-        )
-        result_embed.add_field(
-            name="🛡️ Terminated By", value=f"{ctx.author.mention}", inline=True
-        )
-        result_embed.add_field(
-            name="📋 Reason", value=reason, inline=False
-        )
-        result_embed.add_field(
-            name="🗑️ Roles Removed", value=roles_list, inline=False
-        )
+        result_embed.add_field(name="👤 Member", value=f"{member.mention} (`{member.id}`)", inline=True)
+        result_embed.add_field(name="🛡️ Terminated By", value=f"{ctx.author.mention}", inline=True)
+        result_embed.add_field(name="📋 Reason", value=reason, inline=False)
+        result_embed.add_field(name="🗑️ Roles Removed", value=roles_list, inline=False)
         result_embed.set_thumbnail(url=getattr(member.display_avatar, "url", None))
         result_embed.set_footer(text=ctx.guild.name)
 
@@ -1383,10 +1407,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         # DM the terminated member
         dm_embed = discord.Embed(
             title=f"🚫 You have been terminated from {ctx.guild.name}",
-            description=(
-                f"All of your staff roles have been removed.\n\n"
-                f"**Reason:** {reason}"
-            ),
+            description=f"All of your staff roles have been removed.\n\n**Reason:** {reason}",
             color=COLORS["termination"],
             timestamp=datetime.now(tz=timezone.utc),
         )
@@ -1822,6 +1843,51 @@ class ModStaff(commands.Cog, name="ModStaff"):
         del rank_perks[str(rank_role.id)]
         await self._save_config(ctx.guild.id, {"rank_perks": rank_perks})
         await ctx.send(embed=success_embed("Rank Tier Cleared", f"Perk roles for **{rank_role.name}** have been removed."))
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setteamrole")
+    async def setteamrole(self, ctx: commands.Context):
+        """
+        Set (or clear) the staff team role given to ALL staff members on promotion.
+
+        The team role is:
+          • Added automatically whenever ?promote is used
+          • Removed automatically on ?termination (along with rank + dept roles)
+
+        Usage:
+          `?modstaff setteamrole @StaffTeam` — set the role
+          `?modstaff setteamrole` (no mention) — clear the configured team role
+        """
+        mention_ids = re.findall(r"<@&(\d+)>", ctx.message.content)
+        role_map = {str(r.id): r for r in ctx.message.role_mentions}
+        mentions = [role_map[rid] for rid in mention_ids if rid in role_map]
+
+        if not mentions:
+            cfg = await self._get_config(ctx.guild.id)
+            current = cfg.get("staff_team_role_id")
+            if not current:
+                return await ctx.send(
+                    embed=discord.Embed(
+                        title="👥 Staff Team Role",
+                        description=(
+                            "No staff team role is configured.\n\n"
+                            f"Set one with `{ctx.prefix}modstaff setteamrole @RoleHere`"
+                        ),
+                        color=COLORS.get("config", 0x5865F2),
+                    )
+                )
+            await self._save_config(ctx.guild.id, {"staff_team_role_id": None})
+            return await ctx.send(embed=success_embed("Team Role Cleared", "The staff team role has been removed."))
+
+        role = mentions[0]
+        await self._save_config(ctx.guild.id, {"staff_team_role_id": str(role.id)})
+        await ctx.send(
+            embed=success_embed(
+                "Staff Team Role Set",
+                f"{role.mention} will now be added to every member on `?promote` "
+                f"and removed on `?termination`.",
+            )
+        )
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @modstaff_group.command(name="showranktiers")
