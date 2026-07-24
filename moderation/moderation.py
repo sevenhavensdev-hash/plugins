@@ -1,12 +1,21 @@
 """
-Moderation Plugin for ModMail
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Warns, mutes, bans, softbans, kicks, mod logging,
-staff statistics, leaderboard, promotions and demotions.
+modstaff — Professional Moderation & Staff Management Plugin for Modmail
+=========================================================================
+
+A Dyno-inspired plugin providing full moderation history, staff statistics,
+rank tracking, and a leaderboard — all using Discord embeds and buttons.
+
+Plugin structure follows the official Modmail plugin API exactly:
+  - commands.Cog subclass loaded via setup()
+  - self.bot.plugin_db.get_partition(self) for persistent MongoDB storage
+  - core.checks for permission levels
+  - discord.ui.View / discord.ui.Button for interactive UI
 """
 
-import asyncio
-import re
+from __future__ import annotations
+
+import math
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
 
@@ -14,438 +23,293 @@ import discord
 from discord.ext import commands
 
 from core import checks
-from core.models import PermissionLevel
+from core.models import PermissionLevel, getLogger
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
-
-COLORS = {
-    "warn":    0xF0A500,
-    "mute":    0x5865F2,
-    "unmute":  0x57F287,
-    "kick":    0xFB8C00,
-    "ban":     0xED4245,
-    "softban": 0xFF6B35,
-    "unban":   0x57F287,
-    "note":    0x95A5A6,
-}
-
-ACTION_LABELS = {
-    "warn":    "Warning",
-    "mute":    "Mute",
-    "unmute":  "Unmute",
-    "kick":    "Kick",
-    "ban":     "Ban",
-    "softban": "Softban",
-    "unban":   "Unban",
-    "note":    "Note",
-}
-
-# Full match: 1w2d3h4m5s — any combination, any order isn't supported,
-# but all components are optional so "2h30m" or "7d" both work fine.
-_TIME_RE = re.compile(
-    r"^(?:(?P<weeks>\d+)\s*w(?:eeks?)?)?\s*"
-    r"(?:(?P<days>\d+)\s*d(?:ays?)?)?\s*"
-    r"(?:(?P<hours>\d+)\s*h(?:ours?)?)?\s*"
-    r"(?:(?P<minutes>\d+)\s*m(?:in(?:utes?)?)?)?\s*"
-    r"(?:(?P<seconds>\d+)\s*s(?:econds?)?)?$",
-    re.IGNORECASE,
+from .utils import (
+    COLORS,
+    ACTION_EMOJIS,
+    action_embed,
+    error_embed,
+    success_embed,
+    history_embed,
+    stats_embed,
+    leaderboard_embed,
+    format_dt,
+    format_dt_long,
+    format_duration,
+    parse_duration,
+    time_in_rank,
 )
+from .views import ConfirmView, HistoryView, LeaderboardView
+
+logger = getLogger(__name__)
+
+# Number of history cases displayed per page
+HISTORY_PAGE_SIZE = 5
+# Number of staff members per leaderboard page
+LEADERBOARD_PAGE_SIZE = 10
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+class ModStaff(commands.Cog, name="ModStaff"):
+    """
+    Professional moderation and staff management plugin.
 
-def parse_duration(s: str) -> Optional[timedelta]:
-    m = _TIME_RE.match(s.strip())
-    if not m or not any(m.group(k) for k in ("weeks", "days", "hours", "minutes", "seconds")):
-        return None
-    w  = int(m.group("weeks")   or 0)
-    d  = int(m.group("days")    or 0)
-    h  = int(m.group("hours")   or 0)
-    mi = int(m.group("minutes") or 0)
-    se = int(m.group("seconds") or 0)
-    td = timedelta(weeks=w, days=d, hours=h, minutes=mi, seconds=se)
-    return td if td.total_seconds() > 0 else None
-
-
-def format_duration(td: timedelta) -> str:
-    total = int(td.total_seconds())
-    parts = []
-    for unit, secs in (("week", 604800), ("day", 86400), ("hour", 3600), ("minute", 60), ("second", 1)):
-        val, total = divmod(total, secs)
-        if val:
-            parts.append(f"{val} {unit}{'s' if val != 1 else ''}")
-    return ", ".join(parts) or "0 seconds"
-
-
-def err(msg: str) -> discord.Embed:
-    return discord.Embed(description=f"❌ {msg}", color=0xED4245)
-
-
-def ok(msg: str) -> discord.Embed:
-    return discord.Embed(description=f"✅ {msg}", color=0x57F287)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Cog
-# ──────────────────────────────────────────────────────────────────────────────
-
-class Moderation(commands.Cog):
-    """Moderation commands, logging, and staff tracking."""
+    Provides moderation commands (warn, mute, timeout, kick, ban, softban,
+    unban, note, history), staff management (promote, demote), statistics
+    (staffstats, staffleaderboard), and a full configuration system.
+    """
 
     def __init__(self, bot):
         self.bot = bot
-        self.db  = bot.plugin_db.get_partition(self)
+        # MongoDB partition for persistent storage (Motor/pymongo async)
+        self.db = self.bot.plugin_db.get_partition(self)
 
-    # ── Internal ──────────────────────────────────────────────────────────────
+    # ===========================================================================
+    # Internal database helpers
+    # ===========================================================================
 
-    async def _next_case(self) -> int:
-        doc = await self.db.find_one({"_id": "meta"})
-        n   = ((doc or {}).get("case_count", 0)) + 1
-        await self.db.update_one(
-            {"_id": "meta"},
-            {"$set": {"case_count": n}},
+    async def _next_case_id(self, guild_id: int) -> int:
+        """Atomically increment and return the next case number for this guild."""
+        result = await self.db.find_one_and_update(
+            {"_id": f"case_counter_{guild_id}"},
+            {"$inc": {"count": 1}},
             upsert=True,
+            return_document=True,
         )
-        return n
+        return result.get("count", 1)
 
-    async def _config(self) -> dict:
-        return (await self.db.find_one({"_id": "config"})) or {}
-
-    async def _bump_stats(self, mod_id: int, action: str) -> None:
-        await self.db.update_one(
-            {"_id": str(mod_id), "type": "stats"},
-            {
-                "$inc": {f"actions.{action}": 1, "total": 1},
-                "$set": {"last_active": datetime.now(timezone.utc).isoformat()},
-            },
-            upsert=True,
-        )
-
-    async def _add_record(
+    async def _insert_case(
         self,
+        guild_id: int,
         user_id: int,
+        moderator_id: int,
         action: str,
         reason: str,
-        mod_id: int,
-        case: int,
-        *,
-        duration: Optional[timedelta] = None,
-        extra: Optional[str] = None,
-    ) -> None:
-        entry = {
-            "case":      case,
-            "action":    action,
-            "reason":    reason,
-            "mod":       str(mod_id),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        if duration:
-            entry["duration"] = int(duration.total_seconds())
-        if extra:
-            entry["extra"] = extra
+    ) -> int:
+        """Insert a moderation case and return its case_id."""
+        case_id = await self._next_case_id(guild_id)
+        await self.db.insert_one(
+            {
+                "type": "case",
+                "case_id": case_id,
+                "guild_id": str(guild_id),
+                "user_id": str(user_id),
+                "moderator_id": str(moderator_id),
+                "action": action,
+                "reason": reason or "No reason provided.",
+                "timestamp": time.time(),
+            }
+        )
+        return case_id
 
-        await self.db.update_one(
-            {"_id": str(user_id), "type": "history"},
-            {"$push": {"records": entry}},
+    async def _get_cases(self, guild_id: int, user_id: int) -> list[dict]:
+        """Retrieve all moderation cases for a user in a guild, newest first."""
+        cursor = self.db.find(
+            {"type": "case", "guild_id": str(guild_id), "user_id": str(user_id)}
+        ).sort("timestamp", -1)
+        return await cursor.to_list(length=None)
+
+    async def _bump_staff_stat(
+        self, guild_id: int, moderator_id: int, action: str
+    ):
+        """Increment a moderation stat counter for a staff member."""
+        await self.db.find_one_and_update(
+            {"type": "staff_stats", "guild_id": str(guild_id), "user_id": str(moderator_id)},
+            {"$inc": {f"moderation.{action}": 1}, "$set": {"last_active": time.time()}},
             upsert=True,
         )
 
-    # Warn-specific helpers
-    async def _add_warning(self, user_id: int, reason: str, mod_id: int, case: int) -> int:
-        doc  = await self.db.find_one({"_id": str(user_id), "type": "warnings"})
-        warns = (doc or {}).get("warnings", [])
-        wid   = len(warns) + 1
-        warns.append({
-            "id":        wid,
-            "case":      case,
-            "reason":    reason,
-            "mod":       str(mod_id),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "active":    True,
-        })
-        await self.db.update_one(
-            {"_id": str(user_id), "type": "warnings"},
-            {"$set": {"warnings": warns}},
+    async def _get_staff_doc(self, guild_id: int, user_id: int) -> dict:
+        """Retrieve or create the staff profile document for a user."""
+        doc = await self.db.find_one(
+            {"type": "staff_data", "guild_id": str(guild_id), "user_id": str(user_id)}
+        )
+        return doc or {}
+
+    async def _get_stats_doc(self, guild_id: int, user_id: int) -> dict:
+        """Retrieve or create the stats document for a staff member."""
+        doc = await self.db.find_one(
+            {"type": "staff_stats", "guild_id": str(guild_id), "user_id": str(user_id)}
+        )
+        return doc or {}
+
+    async def _get_config(self, guild_id: int) -> dict:
+        """Retrieve plugin configuration for this guild."""
+        doc = await self.db.find_one(
+            {"type": "config", "guild_id": str(guild_id)}
+        )
+        return doc or {}
+
+    async def _save_config(self, guild_id: int, updates: dict):
+        """Upsert plugin configuration for this guild."""
+        await self.db.find_one_and_update(
+            {"type": "config", "guild_id": str(guild_id)},
+            {"$set": updates},
             upsert=True,
         )
-        return wid
 
-    async def _get_warnings(self, user_id: int) -> list:
-        doc = await self.db.find_one({"_id": str(user_id), "type": "warnings"})
-        return (doc or {}).get("warnings", [])
+    # ===========================================================================
+    # Internal helpers
+    # ===========================================================================
 
-    async def _get_history(self, user_id: int) -> list:
-        doc = await self.db.find_one({"_id": str(user_id), "type": "history"})
-        return (doc or {}).get("records", [])
+    async def _get_log_channel(self, guild: discord.Guild) -> Optional[discord.TextChannel]:
+        """Return the configured log channel, or None if not set."""
+        cfg = await self._get_config(guild.id)
+        ch_id = cfg.get("log_channel_id")
+        if ch_id:
+            return guild.get_channel(int(ch_id))
+        return None
 
-    # Evidence prompt
-    async def _evidence_prompt(self, ctx: commands.Context) -> Optional[str]:
-        prompt = await ctx.send(
-            embed=discord.Embed(
-                description=(
-                    "**Evidence** — Reply with an image link or paste a URL.\n"
-                    "Type `skip` to leave this blank. *(60 second timeout)*"
-                ),
-                color=0x2B2D31,
-            )
-        )
+    async def _send_log(
+        self,
+        guild: discord.Guild,
+        embed: discord.Embed,
+    ):
+        """Send a log embed to the configured log channel, if any."""
+        channel = await self._get_log_channel(guild)
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.warning("Missing permissions to send to log channel %s", channel.id)
+            except discord.HTTPException as e:
+                logger.error("Failed to send log embed: %s", e)
 
-        def check(m: discord.Message) -> bool:
-            return m.author == ctx.author and m.channel == ctx.channel
+    def _get_embed_color(self, cfg: dict, action: str) -> int:
+        """Return the embed color for an action, respecting custom branding."""
+        custom = cfg.get("embed_colors", {})
+        return custom.get(action, COLORS.get(action, 0x7289DA))
 
-        try:
-            reply = await self.bot.wait_for("message", check=check, timeout=60.0)
-            await prompt.delete()
-            content = reply.content.strip()
-            return None if content.lower() in {"skip", "none", "-", "n/a"} else content
-        except asyncio.TimeoutError:
-            await prompt.delete()
-            return None
-
-    # Mod log embed
-    async def _post_log(
+    async def _check_role_permission(
         self,
         ctx: commands.Context,
-        action: str,
-        target: Union[discord.Member, discord.User],
-        reason: str,
-        case: int,
-        *,
-        duration: Optional[timedelta] = None,
-        evidence: Optional[str]       = None,
-        appealable: bool              = False,
-        appeal_link: Optional[str]    = None,
-    ) -> None:
-        cfg = await self._config()
-        ch_id = cfg.get("log_channel")
-        if not ch_id:
-            return
-        channel = ctx.guild.get_channel(int(ch_id))
-        if not channel:
-            return
+        required_roles: list[int],
+    ) -> bool:
+        """
+        Return True if the command author has any of the required_roles.
+        Falls back to standard Modmail permission checks if no roles configured.
+        """
+        if not required_roles:
+            return True  # no role restriction — rely on @has_permissions decorator
+        author_role_ids = {r.id for r in ctx.author.roles}
+        return bool(author_role_ids.intersection(required_roles))
 
-        color = COLORS.get(action, 0x2B2D31)
-        label = ACTION_LABELS.get(action, action.title())
-
-        issued = f"{label} ({format_duration(duration)})" if duration else label
-
-        if appealable and appeal_link:
-            appeal_val = f"[Submit Appeal]({appeal_link})"
-        elif appealable:
-            appeal_val = "Yes"
-        else:
-            appeal_val = "No"
-
-        embed = discord.Embed(color=color, timestamp=datetime.now(timezone.utc))
-        author_kwargs = {"name": f"Case #{case}  ·  {label}"}
-        if ctx.guild.icon:
-            author_kwargs["icon_url"] = ctx.guild.icon.url
-        embed.set_author(**author_kwargs)
-        embed.set_thumbnail(url=target.display_avatar.url)
-
-        embed.add_field(name="User ID & Username",  value=f"`{target.id}` / {target}",   inline=False)
-        embed.add_field(name="Moderation Issued",   value=issued,                          inline=False)
-        embed.add_field(name="Reason",              value=reason or "No reason provided.", inline=False)
-        embed.add_field(name="Appealability",       value=appeal_val,                      inline=False)
-        embed.add_field(name="Evidence",            value=evidence or "None provided.",    inline=False)
-
-        embed.set_footer(text=f"Issued by {ctx.author}  ·  ID {ctx.author.id}")
-
-        await channel.send(embed=embed)
-
-    # Hierarchy check (reusable)
-    def _can_act_on(self, ctx: commands.Context, target: discord.Member) -> bool:
-        if ctx.author == ctx.guild.owner:
-            return True
-        return ctx.author.top_role > target.top_role
-
-    # ── Configuration ─────────────────────────────────────────────────────────
-
-    @commands.group(name="modset", invoke_without_command=True)
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def modset(self, ctx: commands.Context):
-        """Show current moderation plugin settings."""
-        cfg = await self._config()
-
-        log_ch = cfg.get("log_channel")
-        appeal = cfg.get("appeal_link", "Not set")
-        default_appealable = cfg.get("default_appealable", False)
-
-        embed = discord.Embed(
-            title="Moderation — Configuration",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(
-            name="Log Channel",
-            value=f"<#{log_ch}>" if log_ch else "Not configured",
-            inline=True,
-        )
-        embed.add_field(
-            name="Appeal Link",
-            value=appeal,
-            inline=True,
-        )
-        embed.add_field(
-            name="Default Appealability",
-            value="Enabled" if default_appealable else "Disabled",
-            inline=True,
-        )
-        embed.set_footer(text="Use subcommands to update settings.")
-        await ctx.send(embed=embed)
-
-    @modset.command(name="logchannel", aliases=["log"])
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def modset_logchannel(self, ctx: commands.Context, channel: discord.TextChannel):
-        """Set the channel where moderation logs are posted."""
-        await self.db.update_one(
-            {"_id": "config"},
-            {"$set": {"log_channel": str(channel.id)}},
-            upsert=True,
-        )
-        await ctx.send(embed=ok(f"Moderation logs will be posted in {channel.mention}."))
-
-    @modset.command(name="appeal")
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def modset_appeal(self, ctx: commands.Context, url: str):
-        """Set the appeal form URL attached to bans and mutes."""
-        await self.db.update_one(
-            {"_id": "config"},
-            {"$set": {"appeal_link": url}},
-            upsert=True,
-        )
-        await ctx.send(embed=ok(f"Appeal link set: <{url}>"))
-
-    @modset.command(name="appealable")
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def modset_appealable(self, ctx: commands.Context, enabled: bool):
-        """Set whether actions are appealable by default. (true/false)"""
-        await self.db.update_one(
-            {"_id": "config"},
-            {"$set": {"default_appealable": enabled}},
-            upsert=True,
-        )
-        await ctx.send(embed=ok(f"Default appealability set to **{'Yes' if enabled else 'No'}**."))
-
-    # ── Warn ──────────────────────────────────────────────────────────────────
-
-    @commands.command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str):
-        """Issue a warning to a member."""
-        if member.bot:
-            return await ctx.send(embed=err("You cannot warn a bot."))
-        if not self._can_act_on(ctx, member):
-            return await ctx.send(embed=err("You cannot moderate someone with an equal or higher role."))
-
-        case   = await self._next_case()
-        wid    = await self._add_warning(member.id, reason, ctx.author.id, case)
-        warns  = await self._get_warnings(member.id)
-        active = sum(1 for w in warns if w.get("active"))
-
-        await self._record_action_and_stats(ctx, "warn", member, reason, case)
-
-        embed = discord.Embed(
-            description=f"**{member}** has been warned — warning **#{wid}** ({active} active).",
-            color=COLORS["warn"],
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Reason", value=reason)
-        await ctx.send(embed=embed)
-
-        evidence = await self._evidence_prompt(ctx)
-        cfg      = await self._config()
-        await self._post_log(
-            ctx, "warn", member, reason, case,
-            evidence=evidence,
-            appealable=cfg.get("default_appealable", False),
-            appeal_link=cfg.get("appeal_link"),
-        )
-
+    async def _try_dm(
+        self,
+        user: discord.abc.User,
+        embed: discord.Embed,
+    ) -> bool:
+        """Attempt to DM a user. Returns True on success."""
         try:
-            dm = discord.Embed(
-                title=f"Warning — {ctx.guild.name}",
-                description=f"You received a warning in **{ctx.guild.name}**.",
-                color=COLORS["warn"],
+            await user.send(embed=embed)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    # ===========================================================================
+    # Moderation commands
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="warn")
+    async def warn(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        *,
+        reason: str = "No reason provided.",
+    ):
+        """
+        Issue a formal warning to a guild member.
+
+        Usage: `?warn @user [reason]`
+        """
+        if member == ctx.author:
+            return await ctx.send(embed=error_embed("Cannot Warn", "You cannot warn yourself."))
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send(
+                embed=error_embed("Insufficient Hierarchy", "You cannot warn a member with a higher or equal role.")
             )
-            dm.add_field(name="Reason",           value=reason,       inline=False)
-            dm.add_field(name="Active Warnings",  value=str(active),  inline=True)
-            dm.add_field(name="Warning Number",   value=f"#{wid}",    inline=True)
-            await member.send(embed=dm)
-        except discord.Forbidden:
-            pass
 
-    @commands.command(aliases=["warnings"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def warns(self, ctx: commands.Context, member: discord.Member):
-        """View all warnings on record for a member."""
-        warns  = await self._get_warnings(member.id)
-        active = [w for w in warns if w.get("active")]
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "warn", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "warn")
 
-        embed = discord.Embed(
-            title=f"Warnings — {member}",
-            color=COLORS["warn"] if active else 0x57F287,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-
-        if not warns:
-            embed.description = "No warnings on record."
-        else:
-            for w in warns[-10:]:
-                ts     = w.get("timestamp", "")[:10]
-                status = "⚠️" if w.get("active") else "~~pardoned~~"
-                mod    = ctx.guild.get_member(int(w["mod"]))
-                by     = str(mod) if mod else f"ID {w['mod']}"
-                embed.add_field(
-                    name  = f"#{w['id']} {status} · Case #{w.get('case', '?')} · {ts}",
-                    value = f"**Reason:** {w['reason']}\n**By:** {by}",
-                    inline=False,
-                )
-            embed.set_footer(text=f"{len(active)} active · {len(warns)} total")
-
+        embed = action_embed("warn", ctx.author, member, reason, case_id, guild_name=ctx.guild.name)
         await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
 
-    @commands.command(aliases=["delwarn"])
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
-    async def clearwarn(self, ctx: commands.Context, member: discord.Member, warn_id: int):
-        """Pardon a specific warning by its number."""
-        warns = await self._get_warnings(member.id)
-        for w in warns:
-            if w["id"] == warn_id:
-                if not w.get("active"):
-                    return await ctx.send(embed=err(f"Warning #{warn_id} is already pardoned."))
-                w["active"] = False
-                break
-        else:
-            return await ctx.send(embed=err(f"Warning #{warn_id} not found for **{member}**."))
+        dm_embed = action_embed("warn", ctx.author, member, reason, case_id, guild_name=ctx.guild.name)
+        dm_embed.title = f"⚠️ You have been warned in {ctx.guild.name}"
+        await self._try_dm(member, dm_embed)
 
-        await self.db.update_one(
-            {"_id": str(member.id), "type": "warnings"},
-            {"$set": {"warnings": warns}},
-        )
-        await ctx.send(embed=ok(f"Warning #{warn_id} pardoned for **{member}**."))
-
-    @commands.command()
     @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def clearwarns(self, ctx: commands.Context, member: discord.Member):
-        """Clear all warnings for a member."""
-        await self.db.update_one(
-            {"_id": str(member.id), "type": "warnings"},
-            {"$set": {"warnings": []}},
-            upsert=True,
-        )
-        await ctx.send(embed=ok(f"All warnings cleared for **{member}**."))
-
-    # ── Mute ──────────────────────────────────────────────────────────────────
-
-    @commands.command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="mute")
     async def mute(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        duration: str = "10m",
+        *,
+        reason: str = "No reason provided.",
+    ):
+        """
+        Mute a member using Discord timeout (up to 28 days).
+
+        Usage: `?mute @user [duration] [reason]`
+        Duration format: 10s, 5m, 2h, 1d, 1w (max 28d).
+        """
+        if member == ctx.author:
+            return await ctx.send(embed=error_embed("Cannot Mute", "You cannot mute yourself."))
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send(
+                embed=error_embed("Insufficient Hierarchy", "You cannot mute a member with a higher or equal role.")
+            )
+
+        seconds = parse_duration(duration)
+        if seconds is None:
+            return await ctx.send(
+                embed=error_embed(
+                    "Invalid Duration",
+                    "Use a format like `10m`, `2h`, `1d`. Supported units: s, m, h, d, w.",
+                )
+            )
+        if seconds > 28 * 86400:
+            return await ctx.send(
+                embed=error_embed("Duration Too Long", "Discord timeouts are limited to 28 days.")
+            )
+
+        until = discord.utils.utcnow() + timedelta(seconds=seconds)
+        try:
+            await member.timeout(until, reason=f"[Case] {reason} | Mod: {ctx.author}")
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to timeout this member.")
+            )
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
+
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "mute", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "mute")
+
+        embed = action_embed(
+            "mute", ctx.author, member, reason, case_id,
+            extra_fields=[("⏱️ Duration", format_duration(seconds), True)],
+            guild_name=ctx.guild.name,
+        )
+        await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
+
+        dm_embed = action_embed(
+            "mute", ctx.author, member, reason, case_id,
+            extra_fields=[("⏱️ Duration", format_duration(seconds), True)],
+            guild_name=ctx.guild.name,
+        )
+        dm_embed.title = f"🔇 You have been muted in {ctx.guild.name}"
+        await self._try_dm(member, dm_embed)
+
+    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="timeout")
+    async def timeout_cmd(
         self,
         ctx: commands.Context,
         member: discord.Member,
@@ -453,529 +317,890 @@ class Moderation(commands.Cog):
         *,
         reason: str = "No reason provided.",
     ):
-        """Timeout a member. Duration examples: 10m · 2h · 7d (max 28d)."""
-        if member.bot:
-            return await ctx.send(embed=err("You cannot mute a bot."))
-        if not self._can_act_on(ctx, member):
-            return await ctx.send(embed=err("You cannot moderate someone with an equal or higher role."))
+        """
+        Apply a Discord timeout to a member.
 
-        td = parse_duration(duration)
-        if not td:
+        Usage: `?timeout @user <duration> [reason]`
+        Duration format: 10s, 5m, 2h, 1d, 1w (max 28d).
+        """
+        if member == ctx.author:
+            return await ctx.send(embed=error_embed("Cannot Timeout", "You cannot timeout yourself."))
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.send(
-                embed=err(f"`{duration}` is not a valid duration. Try `10m`, `2h`, `3d`, etc.")
+                embed=error_embed("Insufficient Hierarchy", "You cannot timeout a member with a higher or equal role.")
             )
-        if td.total_seconds() > 2419200:
-            return await ctx.send(embed=err("Duration cannot exceed 28 days (Discord limit)."))
-        if member.is_timed_out():
-            return await ctx.send(embed=err(f"**{member}** is already muted."))
 
-        until = datetime.now(timezone.utc) + td
-        await member.timeout(until, reason=f"[{ctx.author}] {reason}")
+        seconds = parse_duration(duration)
+        if seconds is None:
+            return await ctx.send(
+                embed=error_embed("Invalid Duration", "Use a format like `10m`, `2h`, `1d`.")
+            )
+        if seconds > 28 * 86400:
+            return await ctx.send(
+                embed=error_embed("Duration Too Long", "Discord timeouts are limited to 28 days.")
+            )
 
-        case = await self._next_case()
-        await self._record_action_and_stats(ctx, "mute", member, reason, case, duration=td)
-
-        embed = discord.Embed(
-            description=f"**{member}** has been muted for **{format_duration(td)}**.",
-            color=COLORS["mute"],
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Reason", value=reason)
-        await ctx.send(embed=embed)
-
-        evidence = await self._evidence_prompt(ctx)
-        cfg      = await self._config()
-        await self._post_log(
-            ctx, "mute", member, reason, case,
-            duration=td,
-            evidence=evidence,
-            appealable=cfg.get("default_appealable", False),
-            appeal_link=cfg.get("appeal_link"),
-        )
-
+        until = discord.utils.utcnow() + timedelta(seconds=seconds)
         try:
-            dm = discord.Embed(
-                title=f"Muted — {ctx.guild.name}",
-                description=f"You have been muted in **{ctx.guild.name}** for **{format_duration(td)}**.",
-                color=COLORS["mute"],
-            )
-            dm.add_field(name="Reason", value=reason)
-            await member.send(embed=dm)
+            await member.timeout(until, reason=f"[Case] {reason} | Mod: {ctx.author}")
         except discord.Forbidden:
-            pass
-
-    @commands.command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def unmute(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided."):
-        """Remove a timeout from a member."""
-        if not member.is_timed_out():
-            return await ctx.send(embed=err(f"**{member}** is not currently muted."))
-
-        await member.timeout(None, reason=f"[{ctx.author}] {reason}")
-        await self._bump_stats(ctx.author.id, "unmute")
-
-        await ctx.send(embed=ok(f"**{member}** has been unmuted."))
-
-    # ── Kick ──────────────────────────────────────────────────────────────────
-
-    @commands.command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str = "No reason provided."):
-        """Kick a member from the server."""
-        if member.bot:
-            return await ctx.send(embed=err("You cannot kick a bot."))
-        if not self._can_act_on(ctx, member):
-            return await ctx.send(embed=err("You cannot moderate someone with an equal or higher role."))
-
-        try:
-            dm = discord.Embed(
-                title=f"Kicked — {ctx.guild.name}",
-                description=f"You have been kicked from **{ctx.guild.name}**.",
-                color=COLORS["kick"],
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to timeout this member.")
             )
-            dm.add_field(name="Reason", value=reason)
-            await member.send(embed=dm)
-        except discord.Forbidden:
-            pass
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
 
-        await member.kick(reason=f"[{ctx.author}] {reason}")
-        case = await self._next_case()
-        await self._record_action_and_stats(ctx, "kick", member, reason, case)
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "timeout", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "timeout")
 
-        embed = discord.Embed(
-            description=f"**{member}** has been kicked.",
-            color=COLORS["kick"],
-            timestamp=datetime.now(timezone.utc),
+        embed = action_embed(
+            "timeout", ctx.author, member, reason, case_id,
+            extra_fields=[("⏱️ Duration", format_duration(seconds), True)],
+            guild_name=ctx.guild.name,
         )
-        embed.add_field(name="Reason", value=reason)
         await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
 
-        evidence = await self._evidence_prompt(ctx)
-        cfg      = await self._config()
-        await self._post_log(
-            ctx, "kick", member, reason, case,
-            evidence=evidence,
-            appealable=cfg.get("default_appealable", False),
-            appeal_link=cfg.get("appeal_link"),
+        dm_embed = action_embed(
+            "timeout", ctx.author, member, reason, case_id,
+            extra_fields=[("⏱️ Duration", format_duration(seconds), True)],
+            guild_name=ctx.guild.name,
         )
+        dm_embed.title = f"⏱️ You have been timed out in {ctx.guild.name}"
+        await self._try_dm(member, dm_embed)
 
-    # ── Ban ───────────────────────────────────────────────────────────────────
-
-    @commands.command()
     @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def ban(
+    @commands.command(name="kick")
+    async def kick(
         self,
         ctx: commands.Context,
-        target: Union[discord.Member, discord.User],
-        delete_days: Optional[int] = 0,
+        member: discord.Member,
         *,
         reason: str = "No reason provided.",
     ):
-        """Ban a member. Optionally purge message history: `ban @user 7 reason`."""
-        if isinstance(target, discord.Member):
-            if not self._can_act_on(ctx, target):
-                return await ctx.send(embed=err("You cannot moderate someone with an equal or higher role."))
-            try:
-                dm = discord.Embed(
-                    title=f"Banned — {ctx.guild.name}",
-                    description=f"You have been banned from **{ctx.guild.name}**.",
-                    color=COLORS["ban"],
-                )
-                dm.add_field(name="Reason", value=reason)
-                await target.send(embed=dm)
-            except discord.Forbidden:
-                pass
+        """
+        Kick a member from the guild.
 
-        delete_days = max(0, min(delete_days or 0, 7))
-        await ctx.guild.ban(target, reason=f"[{ctx.author}] {reason}", delete_message_days=delete_days)
+        Usage: `?kick @user [reason]`
+        """
+        if member == ctx.author:
+            return await ctx.send(embed=error_embed("Cannot Kick", "You cannot kick yourself."))
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send(
+                embed=error_embed("Insufficient Hierarchy", "You cannot kick a member with a higher or equal role.")
+            )
 
-        case = await self._next_case()
-        await self._record_action_and_stats(ctx, "ban", target, reason, case)
+        dm_embed = action_embed("kick", ctx.author, member, reason, 0, guild_name=ctx.guild.name)
+        dm_embed.title = f"👢 You have been kicked from {ctx.guild.name}"
+        await self._try_dm(member, dm_embed)
 
-        embed = discord.Embed(
-            description=f"**{target}** has been banned.",
-            color=COLORS["ban"],
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Reason", value=reason)
-        if delete_days:
-            embed.add_field(name="Messages Deleted", value=f"{delete_days} day(s)", inline=True)
+        try:
+            await member.kick(reason=f"[Case] {reason} | Mod: {ctx.author}")
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to kick this member.")
+            )
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
+
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "kick", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "kick")
+
+        embed = action_embed("kick", ctx.author, member, reason, case_id, guild_name=ctx.guild.name)
+        # Patch the DM embed's case id (was 0 before we had the case id)
         await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
 
-        evidence = await self._evidence_prompt(ctx)
-        cfg      = await self._config()
-        await self._post_log(
-            ctx, "ban", target, reason, case,
-            evidence=evidence,
-            appealable=True,
-            appeal_link=cfg.get("appeal_link"),
-        )
-
-    @commands.command()
     @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="ban")
+    async def ban(
+        self,
+        ctx: commands.Context,
+        user: Union[discord.Member, discord.User],
+        *,
+        reason: str = "No reason provided.",
+    ):
+        """
+        Ban a user from the guild.
+
+        Usage: `?ban @user [reason]`
+        Accepts user IDs for offline users.
+        """
+        if isinstance(user, discord.Member):
+            if user == ctx.author:
+                return await ctx.send(embed=error_embed("Cannot Ban", "You cannot ban yourself."))
+            if user.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+                return await ctx.send(
+                    embed=error_embed("Insufficient Hierarchy", "You cannot ban a member with a higher or equal role.")
+                )
+            dm_embed = action_embed("ban", ctx.author, user, reason, 0, guild_name=ctx.guild.name)
+            dm_embed.title = f"🔨 You have been banned from {ctx.guild.name}"
+            await self._try_dm(user, dm_embed)
+
+        try:
+            await ctx.guild.ban(user, reason=f"[Case] {reason} | Mod: {ctx.author}", delete_message_days=0)
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to ban this user.")
+            )
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
+
+        case_id = await self._insert_case(ctx.guild.id, user.id, ctx.author.id, "ban", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "ban")
+
+        embed = action_embed("ban", ctx.author, user, reason, case_id, guild_name=ctx.guild.name)
+        await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
+
+    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="softban")
     async def softban(
         self,
         ctx: commands.Context,
         member: discord.Member,
-        delete_days: Optional[int] = 7,
         *,
         reason: str = "No reason provided.",
     ):
-        """Softban: ban then immediately unban to purge recent messages."""
-        if not self._can_act_on(ctx, member):
-            return await ctx.send(embed=err("You cannot moderate someone with an equal or higher role."))
+        """
+        Softban a member (ban then immediately unban to delete recent messages).
 
-        delete_days = max(1, min(delete_days or 7, 7))
+        Usage: `?softban @user [reason]`
+        """
+        if member == ctx.author:
+            return await ctx.send(embed=error_embed("Cannot Softban", "You cannot softban yourself."))
+        if member.top_role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send(
+                embed=error_embed("Insufficient Hierarchy", "You cannot softban a member with a higher or equal role.")
+            )
+
+        dm_embed = action_embed("softban", ctx.author, member, reason, 0, guild_name=ctx.guild.name)
+        dm_embed.title = f"🪃 You have been softbanned from {ctx.guild.name}"
+        await self._try_dm(member, dm_embed)
 
         try:
-            dm = discord.Embed(
-                title=f"Softbanned — {ctx.guild.name}",
-                description=(
-                    f"You have been softbanned from **{ctx.guild.name}**.\n"
-                    "This is not a permanent ban — you may rejoin with an invite link."
-                ),
-                color=COLORS["softban"],
-            )
-            dm.add_field(name="Reason", value=reason)
-            await member.send(embed=dm)
+            await ctx.guild.ban(member, reason=f"[Softban] {reason} | Mod: {ctx.author}", delete_message_days=7)
+            await ctx.guild.unban(member, reason="Softban — auto unban")
         except discord.Forbidden:
-            pass
-
-        await ctx.guild.ban(
-            member,
-            reason=f"[Softban] [{ctx.author}] {reason}",
-            delete_message_days=delete_days,
-        )
-        await ctx.guild.unban(member, reason="Softban — automatic unban")
-
-        case = await self._next_case()
-        await self._record_action_and_stats(ctx, "softban", member, reason, case)
-
-        embed = discord.Embed(
-            description=(
-                f"**{member}** has been softbanned "
-                f"({delete_days} day{'s' if delete_days != 1 else ''} of messages purged)."
-            ),
-            color=COLORS["softban"],
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Reason", value=reason)
-        await ctx.send(embed=embed)
-
-        evidence = await self._evidence_prompt(ctx)
-        cfg      = await self._config()
-        await self._post_log(
-            ctx, "softban", member, reason, case,
-            evidence=evidence,
-            appealable=True,
-            appeal_link=cfg.get("appeal_link"),
-        )
-
-    @commands.command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def unban(self, ctx: commands.Context, user_id: int, *, reason: str = "No reason provided."):
-        """Unban a user by their ID."""
-        try:
-            user = await self.bot.fetch_user(user_id)
-        except discord.NotFound:
-            return await ctx.send(embed=err(f"No user found with ID `{user_id}`."))
-
-        try:
-            await ctx.guild.unban(user, reason=f"[{ctx.author}] {reason}")
-        except discord.NotFound:
-            return await ctx.send(embed=err(f"**{user}** is not currently banned in this server."))
-
-        await self._bump_stats(ctx.author.id, "unban")
-
-        embed = discord.Embed(
-            description=f"**{user}** has been unbanned.",
-            color=COLORS["unban"],
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.add_field(name="Reason", value=reason)
-        await ctx.send(embed=embed)
-
-    # ── Note ──────────────────────────────────────────────────────────────────
-
-    @commands.command()
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def note(self, ctx: commands.Context, member: discord.Member, *, text: str):
-        """Attach a private staff note to a member's record (not visible to user)."""
-        case = await self._next_case()
-        await self._add_record(member.id, "note", text, ctx.author.id, case)
-
-        await ctx.send(
-            embed=discord.Embed(
-                description=f"Note added to **{member}**'s record (Case #{case}).",
-                color=COLORS["note"],
-                timestamp=datetime.now(timezone.utc),
-            ).add_field(name="Note", value=text)
-        )
-
-    # ── History ───────────────────────────────────────────────────────────────
-
-    @commands.command(aliases=["modlogs"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def history(self, ctx: commands.Context, member: discord.Member):
-        """View the full moderation history for a member."""
-        records = await self._get_history(member.id)
-        warns   = await self._get_warnings(member.id)
-        active  = sum(1 for w in warns if w.get("active"))
-
-        embed = discord.Embed(
-            title=f"Moderation History — {member}",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-
-        counts = {}
-        for r in records:
-            counts[r["action"]] = counts.get(r["action"], 0) + 1
-
-        summary_parts = [f"**{ACTION_LABELS.get(k, k)}s:** {v}" for k, v in counts.items()]
-        embed.description = "  ·  ".join(summary_parts) if summary_parts else "No moderation history."
-
-        if active:
-            embed.add_field(name="Active Warnings", value=str(active), inline=True)
-
-        for r in records[-8:]:
-            ts    = r.get("timestamp", "")[:10]
-            label = ACTION_LABELS.get(r["action"], r["action"].title())
-            mod   = ctx.guild.get_member(int(r["mod"]))
-            by    = str(mod) if mod else f"ID {r['mod']}"
-            val   = f"**Reason:** {r['reason']}\n**By:** {by}"
-            if r.get("duration"):
-                val += f"\n**Duration:** {format_duration(timedelta(seconds=r['duration']))}"
-            embed.add_field(
-                name  = f"Case #{r['case']} — {label} · {ts}",
-                value = val,
-                inline=False,
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to softban this member.")
             )
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
 
-        embed.set_footer(text=f"{len(records)} total entries")
-        await ctx.send(embed=embed)
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "softban", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "softban")
 
-    # ── Staff Stats ───────────────────────────────────────────────────────────
-
-    @commands.command(aliases=["modstats"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def staffstats(self, ctx: commands.Context, member: Optional[discord.Member] = None):
-        """View moderation statistics for a staff member."""
-        member = member or ctx.author
-        doc    = await self.db.find_one({"_id": str(member.id), "type": "stats"})
-
-        embed = discord.Embed(
-            title=f"Staff Statistics — {member}",
-            color=0x5865F2,
-            timestamp=datetime.now(timezone.utc),
+        embed = action_embed(
+            "softban", ctx.author, member, reason, case_id,
+            extra_fields=[("ℹ️ Note", "Member was banned then immediately unbanned (messages deleted).", False)],
+            guild_name=ctx.guild.name,
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
-
-        if not doc or not doc.get("actions"):
-            embed.description = "No actions on record for this staff member."
-        else:
-            actions = doc["actions"]
-            total   = doc.get("total", 0)
-            last    = doc.get("last_active", "")[:10] or "Never"
-
-            rows = []
-            for key in ("warn", "mute", "unmute", "kick", "ban", "softban", "unban"):
-                count = actions.get(key, 0)
-                if count:
-                    bar   = "█" * min(count, 15) + ("+" if count > 15 else "")
-                    rows.append(f"`{ACTION_LABELS[key]:<8}` {bar} **{count}**")
-
-            embed.description = "\n".join(rows) if rows else "No actions recorded."
-            embed.add_field(name="Total Actions", value=str(total), inline=True)
-            embed.add_field(name="Last Active",   value=last,        inline=True)
-
         await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
 
-    @commands.command(aliases=["staffleaderboard", "modlb"])
     @checks.has_permissions(PermissionLevel.MODERATOR)
-    async def stafflb(self, ctx: commands.Context):
-        """Show the top active staff members ranked by moderation actions."""
-        cursor = self.db.find({"type": "stats"})
-        docs   = await cursor.to_list(length=100)
-        docs.sort(key=lambda d: d.get("total", 0), reverse=True)
-        docs   = [d for d in docs if d.get("total", 0) > 0]
-
-        embed = discord.Embed(
-            title="Staff Leaderboard",
-            color=0xF0A500,
-            timestamp=datetime.now(timezone.utc),
-        )
-
-        if not docs:
-            embed.description = "No moderation actions have been recorded yet."
-            return await ctx.send(embed=embed)
-
-        medals = {0: "🥇", 1: "🥈", 2: "🥉"}
-        lines  = []
-        for i, doc in enumerate(docs[:10]):
-            try:
-                member = ctx.guild.get_member(int(doc["_id"])) or await self.bot.fetch_user(int(doc["_id"]))
-                name   = str(member)
-            except Exception:
-                name = f"Unknown ({doc['_id']})"
-
-            rank  = medals.get(i, f"`{i + 1:>2}.`")
-            total = doc.get("total", 0)
-            lines.append(f"{rank}  **{name}** — {total} action{'s' if total != 1 else ''}")
-
-        embed.description = "\n".join(lines)
-        embed.set_footer(text=f"Showing top {len(lines)} of {len(docs)} active staff")
-        await ctx.send(embed=embed)
-
-    # ── Promotion / Demotion ──────────────────────────────────────────────────
-
-    async def _post_staff_log(
+    @commands.command(name="unban")
+    async def unban(
         self,
         ctx: commands.Context,
-        action: str,
-        member: discord.Member,
-        role: discord.Role,
-        reason: str,
-    ) -> None:
-        """Post a promotion or demotion entry to the log channel."""
-        cfg = await self._config()
-        ch_id = cfg.get("log_channel")
-        if not ch_id:
-            return
-        channel = ctx.guild.get_channel(int(ch_id))
-        if not channel:
-            return
+        user_id: int,
+        *,
+        reason: str = "No reason provided.",
+    ):
+        """
+        Unban a user by their Discord ID.
 
-        is_promote = action == "promote"
-        color = 0x57F287 if is_promote else 0xED4245
-        label = "Promotion" if is_promote else "Demotion"
-        arrow = "⬆️" if is_promote else "⬇️"
-        verb  = "promoted to" if is_promote else "demoted from"
+        Usage: `?unban <user_id> [reason]`
+        """
+        try:
+            ban_entry = await ctx.guild.fetch_ban(discord.Object(id=user_id))
+        except discord.NotFound:
+            return await ctx.send(
+                embed=error_embed("Not Banned", f"No ban was found for user ID `{user_id}`.")
+            )
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to view bans.")
+            )
 
-        embed = discord.Embed(
-            color=color,
-            timestamp=datetime.now(timezone.utc),
-        )
-        staff_author_kwargs = {"name": f"{arrow} Staff {label}"}
-        if ctx.guild.icon:
-            staff_author_kwargs["icon_url"] = ctx.guild.icon.url
-        embed.set_author(**staff_author_kwargs)
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.add_field(name="User ID & Username", value=f"`{member.id}` / {member}", inline=False)
-        embed.add_field(name=label,                value=f"{arrow} {verb} **{role.name}**",  inline=False)
-        embed.add_field(name="Reason",             value=reason,                              inline=False)
-        embed.set_footer(text=f"Issued by {ctx.author}  ·  ID {ctx.author.id}")
+        user = ban_entry.user
+        try:
+            await ctx.guild.unban(user, reason=f"[Case] {reason} | Mod: {ctx.author}")
+        except discord.Forbidden:
+            return await ctx.send(
+                embed=error_embed("Missing Permissions", "I do not have permission to unban this user.")
+            )
+        except discord.HTTPException as e:
+            return await ctx.send(embed=error_embed("Discord Error", str(e)))
 
-        await channel.send(embed=embed)
+        case_id = await self._insert_case(ctx.guild.id, user.id, ctx.author.id, "unban", reason)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "unban")
 
-    @commands.command()
+        embed = action_embed("unban", ctx.author, user, reason, case_id, guild_name=ctx.guild.name)
+        await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
+
+    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="note")
+    async def note(
+        self,
+        ctx: commands.Context,
+        member: Union[discord.Member, discord.User],
+        *,
+        note: str,
+    ):
+        """
+        Add a staff-only note to a user's moderation history.
+
+        Usage: `?note @user <note text>`
+        """
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "note", note)
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "note")
+
+        embed = action_embed("note", ctx.author, member, note, case_id, guild_name=ctx.guild.name)
+        embed.title = f"📝 Note Added | Case #{case_id}"
+        await ctx.send(embed=embed)
+        await self._send_log(ctx.guild, embed)
+
+    # ===========================================================================
+    # History command
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @commands.command(name="history", aliases=["modlogs", "cases"])
+    async def history(
+        self,
+        ctx: commands.Context,
+        member: Union[discord.Member, discord.User],
+    ):
+        """
+        Display paginated moderation history for a user.
+
+        Usage: `?history @user`
+        """
+        cases = await self._get_cases(ctx.guild.id, member.id)
+
+        if not cases:
+            embed = discord.Embed(
+                title=f"📋 Moderation History — {member.display_name}",
+                description=f"{member.mention} has a clean record. ✅",
+                color=COLORS["history"],
+            )
+            embed.set_thumbnail(url=getattr(member.display_avatar, "url", None))
+            return await ctx.send(embed=embed)
+
+        # Split into pages of HISTORY_PAGE_SIZE
+        chunks = [cases[i:i + HISTORY_PAGE_SIZE] for i in range(0, len(cases), HISTORY_PAGE_SIZE)]
+        total_pages = len(chunks)
+        embeds = [
+            history_embed(member, chunk, page + 1, total_pages)
+            for page, chunk in enumerate(chunks)
+        ]
+
+        if total_pages == 1:
+            return await ctx.send(embed=embeds[0])
+
+        view = HistoryView(author_id=ctx.author.id, embeds=embeds)
+        msg = await ctx.send(embed=embeds[0], view=view)
+        view.message = msg
+
+    # ===========================================================================
+    # Promote command
+    # ===========================================================================
+
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.command(name="promote")
     async def promote(
         self,
         ctx: commands.Context,
         member: discord.Member,
         role: discord.Role,
         *,
-        reason: str = "Staff promotion.",
+        reason: str = "No reason provided.",
     ):
-        """Add a role to a member as a promotion."""
-        if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
-            return await ctx.send(embed=err("You cannot assign a role equal to or higher than your own."))
-        if role in member.roles:
-            return await ctx.send(embed=err(f"**{member}** already has **{role.name}**."))
+        """
+        Promote a member to a staff role with confirmation.
 
-        await member.add_roles(role, reason=f"[Promote] [{ctx.author}] {reason}")
+        Usage: `?promote @user @role [reason]`
 
-        embed = discord.Embed(
-            title="Staff Promotion",
-            description=f"**{member}** has been promoted to **{role.name}**.",
-            color=0x57F287,
-            timestamp=datetime.now(timezone.utc),
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.add_field(name="Promoted By", value=str(ctx.author), inline=True)
-        embed.add_field(name="Role",        value=role.name,       inline=True)
-        embed.add_field(name="Reason",      value=reason,          inline=False)
-        await ctx.send(embed=embed)
+        Requires ADMINISTRATOR permission level or a configured manager role.
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        manager_roles = cfg.get("manager_role_ids", [])
+        if manager_roles:
+            if not await self._check_role_permission(ctx, manager_roles):
+                return await ctx.send(
+                    embed=error_embed(
+                        "Insufficient Permissions",
+                        "You need a configured manager role to use this command.",
+                    )
+                )
 
-        await self._post_staff_log(ctx, "promote", member, role, reason)
-
-        try:
-            dm = discord.Embed(
-                title=f"Promotion — {ctx.guild.name}",
-                description=f"Congratulations! You have been promoted to **{role.name}** in **{ctx.guild.name}**.",
-                color=0x57F287,
+        if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send(
+                embed=error_embed(
+                    "Insufficient Hierarchy",
+                    "You cannot promote someone to a role equal to or higher than your own.",
+                )
             )
-            dm.add_field(name="Reason", value=reason)
-            await member.send(embed=dm)
-        except discord.Forbidden:
-            pass
 
-    @commands.command()
+        # Build confirmation embed
+        confirm_embed = discord.Embed(
+            title="📈 Confirm Promotion",
+            description=(
+                f"Are you sure you want to promote {member.mention} to **{role.name}**?\n\n"
+                f"**Reason:** {reason}"
+            ),
+            color=COLORS["promote"],
+        )
+        confirm_embed.set_thumbnail(url=getattr(member.display_avatar, "url", None))
+        confirm_embed.set_footer(text="This action will be logged and stored.")
+
+        view = ConfirmView(author_id=ctx.author.id, timeout=30.0)
+        msg = await ctx.send(embed=confirm_embed, view=view)
+        view.message = msg
+        await view.wait()
+
+        if view.value is None:
+            return await msg.edit(
+                embed=error_embed("Timed Out", "Promotion was cancelled — no response received."),
+                view=view,
+            )
+        if not view.value:
+            return await msg.edit(
+                embed=error_embed("Cancelled", "Promotion was cancelled."),
+                view=view,
+            )
+
+        # Perform the promotion
+        try:
+            await member.add_roles(role, reason=f"[Promotion] {reason} | Mod: {ctx.author}")
+        except discord.Forbidden:
+            return await msg.edit(
+                embed=error_embed("Missing Permissions", "I cannot assign that role."),
+                view=view,
+            )
+        except discord.HTTPException as e:
+            return await msg.edit(embed=error_embed("Discord Error", str(e)), view=view)
+
+        now_ts = time.time()
+
+        # Record promotion in database
+        await self.db.find_one_and_update(
+            {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+            {
+                "$set": {
+                    "current_rank": role.name,
+                    "rank_since": now_ts,
+                },
+                "$setOnInsert": {"staff_since": now_ts},
+                "$push": {
+                    "promotions": {
+                        "role": role.name,
+                        "role_id": str(role.id),
+                        "promoted_by": str(ctx.author.id),
+                        "reason": reason,
+                        "timestamp": now_ts,
+                    }
+                },
+            },
+            upsert=True,
+        )
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "promote")
+
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "promote", reason)
+
+        result_embed = action_embed(
+            "promote", ctx.author, member, reason, case_id,
+            extra_fields=[
+                ("🏅 New Role", role.mention, True),
+                ("📅 Promoted At", format_dt_long(now_ts), True),
+            ],
+            guild_name=ctx.guild.name,
+        )
+        await msg.edit(embed=result_embed, view=view)
+        await self._send_log(ctx.guild, result_embed)
+
+        # Optional DM notification
+        dm_embed = discord.Embed(
+            title=f"📈 Congratulations! You have been promoted in {ctx.guild.name}",
+            description=(
+                f"You have been promoted to **{role.name}** by {ctx.author.mention}.\n\n"
+                f"**Reason:** {reason}"
+            ),
+            color=COLORS["promote"],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        dm_embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
+        await self._try_dm(member, dm_embed)
+
+    # ===========================================================================
+    # Demote command
+    # ===========================================================================
+
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.command(name="demote")
     async def demote(
         self,
         ctx: commands.Context,
         member: discord.Member,
         role: discord.Role,
+        replacement_role: Optional[discord.Role] = None,
         *,
-        reason: str = "Staff demotion.",
+        reason: str = "No reason provided.",
     ):
-        """Remove a role from a member as a demotion."""
-        if role >= ctx.author.top_role and ctx.author != ctx.guild.owner:
-            return await ctx.send(embed=err("You cannot remove a role equal to or higher than your own."))
+        """
+        Demote a member by removing a staff role with optional replacement.
+
+        Usage: `?demote @user @role [@replacement_role] [reason]`
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        manager_roles = cfg.get("manager_role_ids", [])
+        if manager_roles:
+            if not await self._check_role_permission(ctx, manager_roles):
+                return await ctx.send(
+                    embed=error_embed(
+                        "Insufficient Permissions",
+                        "You need a configured manager role to use this command.",
+                    )
+                )
+
         if role not in member.roles:
-            return await ctx.send(embed=err(f"**{member}** does not have **{role.name}**."))
+            return await ctx.send(
+                embed=error_embed("Role Not Found", f"{member.mention} does not have the role **{role.name}**.")
+            )
 
-        await member.remove_roles(role, reason=f"[Demote] [{ctx.author}] {reason}")
-
-        embed = discord.Embed(
-            title="Staff Demotion",
-            description=f"**{member}** has been demoted from **{role.name}**.",
-            color=0xED4245,
-            timestamp=datetime.now(timezone.utc),
+        desc = (
+            f"Are you sure you want to demote {member.mention} by removing **{role.name}**?"
         )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.add_field(name="Demoted By", value=str(ctx.author), inline=True)
-        embed.add_field(name="Role",       value=role.name,       inline=True)
-        embed.add_field(name="Reason",     value=reason,          inline=False)
-        await ctx.send(embed=embed)
+        if replacement_role:
+            desc += f"\nThey will be assigned **{replacement_role.name}** instead."
+        desc += f"\n\n**Reason:** {reason}"
 
-        await self._post_staff_log(ctx, "demote", member, role, reason)
+        confirm_embed = discord.Embed(
+            title="📉 Confirm Demotion",
+            description=desc,
+            color=COLORS["demote"],
+        )
+        confirm_embed.set_thumbnail(url=getattr(member.display_avatar, "url", None))
+        confirm_embed.set_footer(text="This action will be logged and stored.")
+
+        view = ConfirmView(author_id=ctx.author.id, timeout=30.0)
+        msg = await ctx.send(embed=confirm_embed, view=view)
+        view.message = msg
+        await view.wait()
+
+        if view.value is None:
+            return await msg.edit(
+                embed=error_embed("Timed Out", "Demotion was cancelled — no response received."),
+                view=view,
+            )
+        if not view.value:
+            return await msg.edit(embed=error_embed("Cancelled", "Demotion was cancelled."), view=view)
 
         try:
-            dm = discord.Embed(
-                title=f"Demotion — {ctx.guild.name}",
-                description=f"You have been demoted from **{role.name}** in **{ctx.guild.name}**.",
-                color=0xED4245,
-            )
-            dm.add_field(name="Reason", value=reason)
-            await member.send(embed=dm)
+            await member.remove_roles(role, reason=f"[Demotion] {reason} | Mod: {ctx.author}")
+            if replacement_role:
+                await member.add_roles(replacement_role, reason="Demotion replacement role")
         except discord.Forbidden:
-            pass
+            return await msg.edit(
+                embed=error_embed("Missing Permissions", "I cannot modify this member's roles."),
+                view=view,
+            )
+        except discord.HTTPException as e:
+            return await msg.edit(embed=error_embed("Discord Error", str(e)), view=view)
 
-    # ── Internal stat helper (DRY wrapper) ────────────────────────────────────
+        now_ts = time.time()
 
-    async def _record_action_and_stats(
+        # Record demotion in database
+        await self.db.find_one_and_update(
+            {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+            {
+                "$push": {
+                    "demotions": {
+                        "role_removed": role.name,
+                        "role_id": str(role.id),
+                        "replacement": replacement_role.name if replacement_role else None,
+                        "demoted_by": str(ctx.author.id),
+                        "reason": reason,
+                        "timestamp": now_ts,
+                    }
+                },
+            },
+            upsert=True,
+        )
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "demote")
+
+        case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "demote", reason)
+
+        extra = [("📉 Role Removed", role.mention, True)]
+        if replacement_role:
+            extra.append(("🔄 Replacement Role", replacement_role.mention, True))
+
+        result_embed = action_embed(
+            "demote", ctx.author, member, reason, case_id,
+            extra_fields=extra,
+            guild_name=ctx.guild.name,
+        )
+        await msg.edit(embed=result_embed, view=view)
+        await self._send_log(ctx.guild, result_embed)
+
+        # Optional DM notification
+        dm_embed = discord.Embed(
+            title=f"📉 Staff Update in {ctx.guild.name}",
+            description=(
+                f"You have been demoted from **{role.name}**"
+                + (f" and assigned **{replacement_role.name}**" if replacement_role else "")
+                + f".\n\n**Reason:** {reason}"
+            ),
+            color=COLORS["demote"],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        await self._try_dm(member, dm_embed)
+
+    # ===========================================================================
+    # Staff statistics command
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @commands.command(name="staffstats", aliases=["ss", "mystats"])
+    async def staffstats(
         self,
         ctx: commands.Context,
-        action: str,
-        target: Union[discord.Member, discord.User],
-        reason: str,
-        case: int,
-        *,
-        duration: Optional[timedelta] = None,
-    ) -> None:
-        await asyncio.gather(
-            self._bump_stats(ctx.author.id, action),
-            self._add_record(target.id, action, reason, ctx.author.id, case, duration=duration),
+        member: Optional[Union[discord.Member, discord.User]] = None,
+    ):
+        """
+        Display comprehensive staff statistics for a member.
+
+        Usage: `?staffstats [@user]`
+        Defaults to the command author if no user is specified.
+        """
+        target = member or ctx.author
+
+        staff_doc = await self._get_staff_doc(ctx.guild.id, target.id)
+        stats_doc = await self._get_stats_doc(ctx.guild.id, target.id)
+
+        embed = stats_embed(target, ctx.guild, staff_doc, stats_doc)
+        await ctx.send(embed=embed)
+
+    # ===========================================================================
+    # Staff leaderboard command
+    # ===========================================================================
+
+    async def _build_leaderboard_scores(
+        self, guild_id: int, category: str
+    ) -> list[dict]:
+        """
+        Compute leaderboard entries for a given category.
+        Returns a list of {"user_id": str, "score": int} dicts, sorted descending.
+        """
+        cursor = self.db.find({"type": "staff_stats", "guild_id": str(guild_id)})
+        docs = await cursor.to_list(length=None)
+
+        entries = []
+        now = time.time()
+        month_start = now - 30 * 86400  # last 30 days approximation
+
+        for doc in docs:
+            m = doc.get("moderation", {})
+            t = doc.get("tickets", {})
+
+            mod_total = sum(
+                m.get(k, 0)
+                for k in ("warn", "mute", "timeout", "kick", "ban", "softban", "unban", "note", "promote", "demote")
+            )
+
+            if category == "overall":
+                score = mod_total + t.get("total", 0) + t.get("messages_sent", 0)
+            elif category == "tickets":
+                score = t.get("total", 0)
+            elif category == "moderation":
+                score = mod_total
+            elif category == "messages":
+                score = t.get("messages_sent", 0)
+            elif category == "monthly":
+                # For monthly, we sum actions from the last 30 days using case records
+                # This is an approximation using stored data; a full monthly breakdown
+                # would require per-timestamp indexes.
+                score = mod_total  # fallback — monthly tracking requires extra collection
+            else:
+                score = 0
+
+            if score > 0:
+                entries.append({"user_id": doc.get("user_id", "?"), "score": score})
+
+        entries.sort(key=lambda x: x["score"], reverse=True)
+        return entries
+
+    async def _get_leaderboard_page(
+        self, guild_id: int, category: str, page: int
+    ):
+        """Return (embed, total_pages) for a leaderboard page request."""
+        guild = self.bot.get_guild(guild_id)
+        all_entries = await self._build_leaderboard_scores(guild_id, category)
+        total = len(all_entries)
+        total_pages = max(1, math.ceil(total / LEADERBOARD_PAGE_SIZE))
+        page = max(1, min(page, total_pages))
+        slice_start = (page - 1) * LEADERBOARD_PAGE_SIZE
+        page_entries = all_entries[slice_start:slice_start + LEADERBOARD_PAGE_SIZE]
+        embed = leaderboard_embed(category, page_entries, guild, page, total_pages)
+        return embed, total_pages
+
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @commands.command(name="staffleaderboard", aliases=["slb", "leaderboard"])
+    async def staffleaderboard(self, ctx: commands.Context):
+        """
+        Display the interactive staff leaderboard.
+
+        Navigate between categories (Overall, Tickets, Moderation, Monthly)
+        and pages using the buttons below the embed.
+
+        Usage: `?staffleaderboard`
+        """
+        guild_id = ctx.guild.id
+
+        embed, total_pages = await self._get_leaderboard_page(guild_id, "overall", 1)
+
+        async def get_page(category: str, page: int):
+            return await self._get_leaderboard_page(guild_id, category, page)
+
+        view = LeaderboardView(
+            author_id=ctx.author.id,
+            get_page_func=get_page,
+            initial_embed=embed,
+            initial_total_pages=total_pages,
+        )
+        msg = await ctx.send(embed=embed, view=view)
+        view.message = msg
+
+    # ===========================================================================
+    # Configuration commands
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.group(name="modstaff", invoke_without_command=True)
+    async def modstaff_group(self, ctx: commands.Context):
+        """
+        ModStaff plugin configuration.
+
+        Run `?modstaff` to see this help message.
+        Subcommands: setlog, setcolor, setstaffrole, setmanager, help
+        """
+        prefix = ctx.prefix
+        embed = discord.Embed(
+            title="⚙️ ModStaff Configuration",
+            description="Use the subcommands below to configure the plugin.",
+            color=COLORS["config"],
+        )
+        embed.add_field(
+            name="Available Subcommands",
+            value=(
+                f"`{prefix}modstaff setlog <#channel>` — Set the moderation log channel\n"
+                f"`{prefix}modstaff setcolor <action> <hex>` — Set embed color for an action\n"
+                f"`{prefix}modstaff setstaffrole <@role>` — Add/remove a staff role\n"
+                f"`{prefix}modstaff setmanager <@role>` — Add/remove a manager role\n"
+                f"`{prefix}modstaff showconfig` — Show current plugin configuration\n"
+                f"`{prefix}modstaff help` — Show this message"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="ModStaff Plugin | Requires Administrator")
+        await ctx.send(embed=embed)
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setlog")
+    async def setlog(self, ctx: commands.Context, channel: discord.TextChannel):
+        """
+        Set the channel where moderation actions are logged.
+
+        Usage: `?modstaff setlog #channel`
+        """
+        await self._save_config(ctx.guild.id, {"log_channel_id": str(channel.id)})
+        await ctx.send(
+            embed=success_embed("Log Channel Set", f"Moderation actions will now be logged in {channel.mention}.")
         )
 
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setcolor")
+    async def setcolor(self, ctx: commands.Context, action: str, color_hex: str):
+        """
+        Set a custom embed color for a moderation action.
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
+        Usage: `?modstaff setcolor ban #FF0000`
+        Valid actions: warn, mute, timeout, kick, ban, softban, unban, note, promote, demote
+        """
+        action = action.lower()
+        if action not in COLORS:
+            return await ctx.send(
+                embed=error_embed("Invalid Action", f"Unknown action `{action}`. Valid: {', '.join(COLORS.keys())}")
+            )
+        color_hex = color_hex.lstrip("#")
+        try:
+            color_int = int(color_hex, 16)
+        except ValueError:
+            return await ctx.send(embed=error_embed("Invalid Color", "Provide a valid hex color, e.g. `#FF5733`."))
 
-async def setup(bot) -> None:
-    await bot.add_cog(Moderation(bot))
+        cfg = await self._get_config(ctx.guild.id)
+        embed_colors = cfg.get("embed_colors", {})
+        embed_colors[action] = color_int
+        await self._save_config(ctx.guild.id, {"embed_colors": embed_colors})
+        await ctx.send(embed=success_embed("Color Updated", f"Color for **{action}** set to `#{color_hex.upper()}`."))
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setstaffrole")
+    async def setstaffrole(self, ctx: commands.Context, role: discord.Role):
+        """
+        Toggle a role as a staff role (adds if not present, removes if present).
+
+        Usage: `?modstaff setstaffrole @role`
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        staff_roles = cfg.get("staff_role_ids", [])
+        role_id = str(role.id)
+
+        if role_id in staff_roles:
+            staff_roles.remove(role_id)
+            msg = f"**{role.name}** removed from staff roles."
+        else:
+            staff_roles.append(role_id)
+            msg = f"**{role.name}** added to staff roles."
+
+        await self._save_config(ctx.guild.id, {"staff_role_ids": staff_roles})
+        await ctx.send(embed=success_embed("Staff Role Updated", msg))
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setmanager")
+    async def setmanager(self, ctx: commands.Context, role: discord.Role):
+        """
+        Toggle a role as a manager role (can use promote/demote commands).
+
+        Usage: `?modstaff setmanager @role`
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        manager_roles = cfg.get("manager_role_ids", [])
+        role_id = str(role.id)
+
+        if role_id in manager_roles:
+            manager_roles.remove(role_id)
+            msg = f"**{role.name}** removed from manager roles."
+        else:
+            manager_roles.append(role_id)
+            msg = f"**{role.name}** added to manager roles."
+
+        await self._save_config(ctx.guild.id, {"manager_role_ids": manager_roles})
+        await ctx.send(embed=success_embed("Manager Role Updated", msg))
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="showconfig")
+    async def showconfig(self, ctx: commands.Context):
+        """
+        Display current plugin configuration for this guild.
+
+        Usage: `?modstaff showconfig`
+        """
+        cfg = await self._get_config(ctx.guild.id)
+
+        log_ch_id = cfg.get("log_channel_id")
+        log_ch = ctx.guild.get_channel(int(log_ch_id)).mention if log_ch_id else "Not set"
+
+        staff_role_ids = cfg.get("staff_role_ids", [])
+        staff_roles = ", ".join(
+            f"<@&{r}>" for r in staff_role_ids
+        ) or "None configured"
+
+        manager_role_ids = cfg.get("manager_role_ids", [])
+        manager_roles = ", ".join(
+            f"<@&{r}>" for r in manager_role_ids
+        ) or "None configured (uses ADMINISTRATOR level)"
+
+        embed = discord.Embed(
+            title="⚙️ ModStaff Configuration",
+            color=COLORS["config"],
+        )
+        embed.add_field(name="📋 Log Channel", value=log_ch, inline=False)
+        embed.add_field(name="👥 Staff Roles", value=staff_roles, inline=False)
+        embed.add_field(name="🔑 Manager Roles", value=manager_roles, inline=False)
+
+        custom_colors = cfg.get("embed_colors", {})
+        if custom_colors:
+            color_lines = "\n".join(
+                f"`{action}` → `#{hex(val)[2:].upper().zfill(6)}`"
+                for action, val in custom_colors.items()
+            )
+            embed.add_field(name="🎨 Custom Embed Colors", value=color_lines, inline=False)
+
+        embed.set_footer(text=f"Guild: {ctx.guild.name}")
+        await ctx.send(embed=embed)
+
+    # ===========================================================================
+    # Error handler
+    # ===========================================================================
+
+    @commands.Cog.listener()
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        """
+        Global error handler for this cog.
+        Provides friendly embeds for common error types.
+        """
+        # Only handle errors from this cog's commands
+        if ctx.cog is not self:
+            return
+
+        if isinstance(error, commands.MissingRequiredArgument):
+            embed = error_embed(
+                "Missing Argument",
+                f"Missing required argument: `{error.param.name}`.\n"
+                f"Run `{ctx.prefix}help {ctx.command.qualified_name}` for usage.",
+            )
+            await ctx.send(embed=embed)
+
+        elif isinstance(error, commands.BadArgument):
+            embed = error_embed(
+                "Invalid Argument",
+                f"{error}\nRun `{ctx.prefix}help {ctx.command.qualified_name}` for usage.",
+            )
+            await ctx.send(embed=embed)
+
+        elif isinstance(error, commands.MemberNotFound):
+            await ctx.send(embed=error_embed("Member Not Found", f"No member found for `{error.argument}`."))
+
+        elif isinstance(error, commands.UserNotFound):
+            await ctx.send(embed=error_embed("User Not Found", f"No user found for `{error.argument}`."))
+
+        elif isinstance(error, commands.RoleNotFound):
+            await ctx.send(embed=error_embed("Role Not Found", f"No role found for `{error.argument}`."))
+
+        elif isinstance(error, commands.ChannelNotFound):
+            await ctx.send(embed=error_embed("Channel Not Found", f"No channel found for `{error.argument}`."))
+
+        elif isinstance(error, commands.CheckFailure):
+            await ctx.send(
+                embed=error_embed(
+                    "Insufficient Permissions",
+                    "You do not have permission to use this command.",
+                )
+            )
+
+        elif isinstance(error, commands.CommandInvokeError):
+            original = error.original
+            logger.error("Command error in %s: %s", ctx.command, original, exc_info=original)
+            await ctx.send(
+                embed=error_embed(
+                    "Unexpected Error",
+                    "An unexpected error occurred. It has been logged.\n"
+                    f"```{type(original).__name__}: {original}```",
+                )
+            )
+
+        else:
+            logger.error("Unhandled command error: %s", error, exc_info=error)
+
+
+# ===========================================================================
+# Plugin setup — required entry point
+# ===========================================================================
+
+async def setup(bot):
+    """Register the ModStaff cog with the Modmail bot."""
+    await bot.add_cog(ModStaff(bot))
