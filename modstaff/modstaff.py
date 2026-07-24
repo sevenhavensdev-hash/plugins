@@ -157,6 +157,28 @@ class ModStaff(commands.Cog, name="ModStaff"):
         )
         return doc or {}
 
+    async def _get_rank_order(self, guild: discord.Guild):
+        """Return the configured rank ladder (list of role id strings, low → high)."""
+        cfg = await self._get_config(guild.id)
+        return cfg.get("rank_order", [])
+
+    async def _get_member_ladder_role(
+        self, guild: discord.Guild, member: discord.Member
+    ) -> Optional[discord.Role]:
+        """
+        Return the highest role the member currently holds that appears in the
+        rank ladder, or None if they hold none.
+        """
+        rank_order = await self._get_rank_order(guild)
+        if not rank_order:
+            return None
+        member_role_ids = {str(r.id) for r in member.roles}
+        # Walk highest → lowest and return the first match
+        for rid in reversed(rank_order):
+            if rid in member_role_ids:
+                return guild.get_role(int(rid))
+        return None
+
     async def _get_next_lower_role(
         self, guild: discord.Guild, role: discord.Role
     ) -> Optional[discord.Role]:
@@ -166,8 +188,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         The rank_order list is stored lowest → highest.
         """
-        cfg = await self._get_config(guild.id)
-        rank_order = cfg.get("rank_order", [])  # list of role id strings, low → high
+        rank_order = await self._get_rank_order(guild)
         if not rank_order:
             return None
         try:
@@ -178,6 +199,63 @@ class ModStaff(commands.Cog, name="ModStaff"):
             return None  # already at the bottom
         lower_id = rank_order[idx - 1]
         return guild.get_role(int(lower_id))
+
+    async def _get_next_higher_role(
+        self, guild: discord.Guild, role: discord.Role
+    ) -> Optional[discord.Role]:
+        """
+        Given the member's current highest ladder role, return the next role up,
+        or None if already at the top.
+        """
+        rank_order = await self._get_rank_order(guild)
+        if not rank_order:
+            return None
+        try:
+            idx = rank_order.index(str(role.id))
+        except ValueError:
+            return None
+        if idx >= len(rank_order) - 1:
+            return None  # already at the top
+        return guild.get_role(int(rank_order[idx + 1]))
+
+    async def _apply_rank_perks(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        old_role: Optional[discord.Role],
+        new_role: Optional[discord.Role],
+    ):
+        """
+        Add/remove perk roles (LR, MR, department roles, etc.) when a member
+        moves from old_role to new_role.
+
+        rank_perks config shape: { "<rank_role_id>": ["<perk_role_id>", ...] }
+
+        Only the *difference* is touched — perk roles shared by both ranks are
+        left alone so members never briefly lose a shared role.
+
+        Returns (added, removed) lists of discord.Role objects for display.
+        """
+        cfg = await self._get_config(guild.id)
+        rank_perks: dict = cfg.get("rank_perks", {})
+
+        old_perks = set(rank_perks.get(str(old_role.id), [])) if old_role else set()
+        new_perks = set(rank_perks.get(str(new_role.id), [])) if new_role else set()
+
+        to_add = [guild.get_role(int(rid)) for rid in new_perks - old_perks]
+        to_remove = [guild.get_role(int(rid)) for rid in old_perks - new_perks]
+        to_add = [r for r in to_add if r is not None]
+        to_remove = [r for r in to_remove if r is not None]
+
+        try:
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Rank perk update")
+            if to_add:
+                await member.add_roles(*to_add, reason="Rank perk update")
+        except (discord.Forbidden, discord.HTTPException) as e:
+            logger.warning("Failed to apply rank perks for %s: %s", member.id, e)
+
+        return to_add, to_remove
 
     async def _save_config(self, guild_id: int, updates: dict):
         """Upsert plugin configuration for this guild."""
@@ -793,15 +871,17 @@ class ModStaff(commands.Cog, name="ModStaff"):
         self,
         ctx: commands.Context,
         member: discord.Member,
-        role: discord.Role,
+        role: Optional[discord.Role] = None,
         *,
         reason: str = "No reason provided.",
     ):
         """
         Promote a member to a staff role with confirmation.
 
-        Usage: `?promote @user @role [reason]`
+        Usage: `?promote <@user|ID> [@role] [reason]`
 
+        If no role is given and a rank ladder is configured, the next role up
+        from the member's current ladder rank is used automatically.
         If staff roles are configured, the target role must be one of them.
         Requires ADMINISTRATOR permission level or a configured manager role.
         """
@@ -816,8 +896,35 @@ class ModStaff(commands.Cog, name="ModStaff"):
                     )
                 )
 
+        # Auto-detect role from rank ladder if none provided
+        if role is None:
+            current = await self._get_member_ladder_role(ctx.guild, member)
+            if current is None:
+                rank_order = await self._get_rank_order(ctx.guild)
+                if not rank_order:
+                    return await ctx.send(
+                        embed=error_embed(
+                            "No Role Specified",
+                            f"No rank ladder is configured. Either specify a role: "
+                            f"`{ctx.prefix}promote @user @role` or set up a ladder with "
+                            f"`{ctx.prefix}modstaff setrankorder`.",
+                        )
+                    )
+                # Member has no ladder role — start them at the bottom
+                role = ctx.guild.get_role(int(rank_order[0]))
+                if role is None:
+                    return await ctx.send(embed=error_embed("Role Not Found", "The lowest ladder role no longer exists."))
+            else:
+                role = await self._get_next_higher_role(ctx.guild, current)
+                if role is None:
+                    return await ctx.send(
+                        embed=error_embed(
+                            "Already at Top",
+                            f"{member.mention} is already at the highest configured rank (**{current.name}**).",
+                        )
+                    )
+
         # Only enforce the staff-role whitelist when it has been configured.
-        # This allows promote to work freely until the server admin sets it up.
         staff_role_ids = cfg.get("staff_role_ids", [])
         if staff_role_ids and str(role.id) not in staff_role_ids:
             return await ctx.send(
@@ -836,6 +943,9 @@ class ModStaff(commands.Cog, name="ModStaff"):
                     "You cannot promote someone to a role equal to or higher than your own.",
                 )
             )
+
+        # Capture current ladder role before promoting (needed for perk diff)
+        old_ladder_role = await self._get_member_ladder_role(ctx.guild, member)
 
         # Build confirmation embed
         confirm_embed = discord.Embed(
@@ -875,6 +985,11 @@ class ModStaff(commands.Cog, name="ModStaff"):
             )
         except discord.HTTPException as e:
             return await msg.edit(embed=error_embed("Discord Error", str(e)), view=view)
+
+        # Apply rank perks (LR/MR/department roles etc.)
+        perks_added, perks_removed = await self._apply_rank_perks(
+            ctx.guild, member, old_ladder_role, role
+        )
 
         now_ts = time.time()
 
@@ -921,24 +1036,32 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "promote", reason)
 
+        promote_extra = [
+            ("🏅 New Role", role.mention, True),
+            ("📅 Promoted At", format_dt_long(now_ts), True),
+        ]
+        if perks_added:
+            promote_extra.append(("➕ Perks Added", " ".join(r.mention for r in perks_added), False))
+        if perks_removed:
+            promote_extra.append(("➖ Perks Removed", " ".join(r.mention for r in perks_removed), False))
+
         result_embed = action_embed(
             "promote", ctx.author, member, reason, case_id,
-            extra_fields=[
-                ("🏅 New Role", role.mention, True),
-                ("📅 Promoted At", format_dt_long(now_ts), True),
-            ],
+            extra_fields=promote_extra,
             guild_name=ctx.guild.name,
         )
         await msg.edit(embed=result_embed, view=view)
         await self._send_log(ctx.guild, result_embed)
 
         # Optional DM notification
+        dm_desc = f"You have been promoted to **{role.name}** by {ctx.author.mention}.\n\n**Reason:** {reason}"
+        if perks_added:
+            dm_desc += f"\n\n**Roles added:** {', '.join(r.name for r in perks_added)}"
+        if perks_removed:
+            dm_desc += f"\n**Roles removed:** {', '.join(r.name for r in perks_removed)}"
         dm_embed = discord.Embed(
             title=f"📈 Congratulations! You have been promoted in {ctx.guild.name}",
-            description=(
-                f"You have been promoted to **{role.name}** by {ctx.author.mention}.\n\n"
-                f"**Reason:** {reason}"
-            ),
+            description=dm_desc,
             color=COLORS["promote"],
             timestamp=datetime.now(tz=timezone.utc),
         )
@@ -955,7 +1078,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         self,
         ctx: commands.Context,
         member: discord.Member,
-        role: discord.Role,
+        role: Optional[discord.Role] = None,
         replacement_role: Optional[discord.Role] = None,
         *,
         reason: str = "No reason provided.",
@@ -963,10 +1086,12 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         Demote a member by removing a staff role.
 
-        Usage: `?demote @user @role [@replacement_role] [reason]`
+        Usage: `?demote <@user|ID> [@role] [@replacement_role] [reason]`
 
-        If a rank ladder is configured via `?modstaff setrankorder`, the next
-        lower role is assigned automatically when no replacement is specified.
+        If no role is given and a rank ladder is configured, the member's
+        current highest ladder role is detected automatically.
+        The next lower role in the ladder is assigned automatically unless
+        you specify a replacement.
         """
         cfg = await self._get_config(ctx.guild.id)
         manager_roles = cfg.get("manager_role_ids", [])
@@ -976,6 +1101,27 @@ class ModStaff(commands.Cog, name="ModStaff"):
                     embed=error_embed(
                         "Insufficient Permissions",
                         "You need a configured manager role to use this command.",
+                    )
+                )
+
+        # Auto-detect role from rank ladder if none provided
+        if role is None:
+            role = await self._get_member_ladder_role(ctx.guild, member)
+            if role is None:
+                rank_order = await self._get_rank_order(ctx.guild)
+                if not rank_order:
+                    return await ctx.send(
+                        embed=error_embed(
+                            "No Role Specified",
+                            f"No rank ladder is configured. Either specify a role: "
+                            f"`{ctx.prefix}demote @user @role` or set up a ladder with "
+                            f"`{ctx.prefix}modstaff setrankorder`.",
+                        )
+                    )
+                return await ctx.send(
+                    embed=error_embed(
+                        "No Ladder Role Found",
+                        f"{member.mention} does not hold any role from the rank ladder.",
                     )
                 )
 
@@ -1026,6 +1172,11 @@ class ModStaff(commands.Cog, name="ModStaff"):
         except discord.HTTPException as e:
             return await msg.edit(embed=error_embed("Discord Error", str(e)), view=view)
 
+        # Apply rank perks (LR/MR/department roles etc.)
+        perks_added, perks_removed = await self._apply_rank_perks(
+            ctx.guild, member, role, replacement_role
+        )
+
         now_ts = time.time()
 
         # Record demotion in database
@@ -1058,6 +1209,10 @@ class ModStaff(commands.Cog, name="ModStaff"):
         extra = [("📉 Role Removed", role.mention, True)]
         if replacement_role:
             extra.append(("🔄 New Role", replacement_role.mention, True))
+        if perks_added:
+            extra.append(("➕ Perks Added", " ".join(r.mention for r in perks_added), False))
+        if perks_removed:
+            extra.append(("➖ Perks Removed", " ".join(r.mention for r in perks_removed), False))
 
         result_embed = action_embed(
             "demote", ctx.author, member, reason, case_id,
@@ -1068,13 +1223,18 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await self._send_log(ctx.guild, result_embed)
 
         # DM notification
+        dm_desc = (
+            f"You have been demoted from **{role.name}**"
+            + (f" and assigned **{replacement_role.name}**" if replacement_role else "")
+            + f".\n\n**Reason:** {reason}"
+        )
+        if perks_added:
+            dm_desc += f"\n\n**Roles added:** {', '.join(r.name for r in perks_added)}"
+        if perks_removed:
+            dm_desc += f"\n**Roles removed:** {', '.join(r.name for r in perks_removed)}"
         dm_embed = discord.Embed(
             title=f"📉 Staff Update in {ctx.guild.name}",
-            description=(
-                f"You have been demoted from **{role.name}**"
-                + (f" and assigned **{replacement_role.name}**" if replacement_role else "")
-                + f".\n\n**Reason:** {reason}"
-            ),
+            description=dm_desc,
             color=COLORS["demote"],
             timestamp=datetime.now(tz=timezone.utc),
         )
@@ -1380,6 +1540,9 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"`{prefix}modstaff setmanager <@role>` — Add/remove a manager role\n"
                 f"`{prefix}modstaff setrankorder [@role1 @role2 ...]` — Set/view rank ladder (low → high)\n"
                 f"`{prefix}modstaff clearrankorder` — Remove the rank ladder\n"
+                f"`{prefix}modstaff setranktier @rank [@perk1 ...]` — Attach perk roles (LR/MR/dept) to a rank\n"
+                f"`{prefix}modstaff clearranktier @rank` — Remove perk roles from a rank\n"
+                f"`{prefix}modstaff showranktiers` — Show all configured rank tier perks\n"
                 f"`{prefix}modstaff showconfig` — Show current plugin configuration\n"
                 f"`{prefix}modstaff help` — Show this message"
             ),
@@ -1556,6 +1719,154 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await ctx.send(embed=success_embed("Rank Ladder Cleared", "The rank ladder has been removed."))
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setranktier")
+    async def setranktier(self, ctx: commands.Context):
+        """
+        Attach extra roles (LR, MR, department, etc.) to a rank.
+
+        The FIRST role mentioned is the rank. All remaining mentions are the
+        perk roles that get added when someone reaches that rank (and removed
+        when they leave it, unless the next rank shares the same perk).
+
+        Usage:
+          `?modstaff setranktier @TrialMod @LowRank`
+          `?modstaff setranktier @SeniorMod @MidRank @StaffDept`
+          `?modstaff setranktier @TrialMod` — view current perks for that rank
+          `?modstaff clearranktier @TrialMod` — remove all perks for that rank
+
+        Perk roles are applied automatically during ?promote and ?demote.
+        Only the *difference* between old and new perks is touched, so shared
+        roles (e.g. LR on both Trial and Mod) are never removed mid-ladder.
+        """
+        mention_ids = re.findall(r"<@&(\d+)>", ctx.message.content)
+        role_map = {str(r.id): r for r in ctx.message.role_mentions}
+        mentions = [role_map[rid] for rid in mention_ids if rid in role_map]
+
+        if not mentions:
+            return await ctx.send(
+                embed=error_embed(
+                    "No Rank Specified",
+                    f"Mention the rank role first, then its perk roles.\n"
+                    f"Example: `{ctx.prefix}modstaff setranktier @TrialMod @LowRank`",
+                )
+            )
+
+        rank_role = mentions[0]
+        perk_roles = mentions[1:]
+
+        cfg = await self._get_config(ctx.guild.id)
+        rank_perks: dict = cfg.get("rank_perks", {})
+
+        # View mode — only rank mentioned, no perks
+        if not perk_roles:
+            current = rank_perks.get(str(rank_role.id), [])
+            if not current:
+                return await ctx.send(
+                    embed=discord.Embed(
+                        title=f"🎖️ Rank Tier: {rank_role.name}",
+                        description=(
+                            f"No perk roles are configured for **{rank_role.name}**.\n\n"
+                            f"Add some: `{ctx.prefix}modstaff setranktier {rank_role.mention} @PerkRole1 @PerkRole2`"
+                        ),
+                        color=COLORS.get("config", 0x5865F2),
+                    )
+                )
+            perk_display = "\n".join(f"<@&{rid}>" for rid in current)
+            return await ctx.send(
+                embed=discord.Embed(
+                    title=f"🎖️ Rank Tier: {rank_role.name}",
+                    description=f"**Perk roles (auto-applied on promotion/demotion):**\n{perk_display}",
+                    color=COLORS.get("config", 0x5865F2),
+                )
+            )
+
+        rank_perks[str(rank_role.id)] = [str(r.id) for r in perk_roles]
+        await self._save_config(ctx.guild.id, {"rank_perks": rank_perks})
+
+        perk_display = "\n".join(f"• {r.mention}" for r in perk_roles)
+        embed = discord.Embed(
+            title=f"🎖️ Rank Tier Set: {rank_role.name}",
+            description=(
+                f"The following perk roles will be **added** when someone is promoted to "
+                f"**{rank_role.name}**, and **removed** when they leave it "
+                f"(unless the next rank shares the perk):\n\n{perk_display}"
+            ),
+            color=COLORS.get("success", 0x57F287),
+        )
+        await ctx.send(embed=embed)
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="clearranktier")
+    async def clearranktier(self, ctx: commands.Context):
+        """
+        Remove all perk roles from a rank tier.
+
+        Usage: `?modstaff clearranktier @RankRole`
+        """
+        mention_ids = re.findall(r"<@&(\d+)>", ctx.message.content)
+        role_map = {str(r.id): r for r in ctx.message.role_mentions}
+        mentions = [role_map[rid] for rid in mention_ids if rid in role_map]
+
+        if not mentions:
+            return await ctx.send(
+                embed=error_embed("No Rank Specified", f"Mention the rank role to clear. Example: `{ctx.prefix}modstaff clearranktier @TrialMod`")
+            )
+
+        rank_role = mentions[0]
+        cfg = await self._get_config(ctx.guild.id)
+        rank_perks: dict = cfg.get("rank_perks", {})
+
+        if str(rank_role.id) not in rank_perks:
+            return await ctx.send(embed=error_embed("Nothing to Clear", f"**{rank_role.name}** has no configured perk roles."))
+
+        del rank_perks[str(rank_role.id)]
+        await self._save_config(ctx.guild.id, {"rank_perks": rank_perks})
+        await ctx.send(embed=success_embed("Rank Tier Cleared", f"Perk roles for **{rank_role.name}** have been removed."))
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="showranktiers")
+    async def showranktiers(self, ctx: commands.Context):
+        """
+        Show all configured rank tier perk roles.
+
+        Usage: `?modstaff showranktiers`
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        rank_perks: dict = cfg.get("rank_perks", {})
+        rank_order: list = cfg.get("rank_order", [])
+
+        if not rank_perks:
+            return await ctx.send(
+                embed=discord.Embed(
+                    title="🎖️ Rank Tier Perks",
+                    description=(
+                        "No rank tiers are configured.\n\n"
+                        f"Set one with `{ctx.prefix}modstaff setranktier @RankRole @PerkRole1 ...`"
+                    ),
+                    color=COLORS.get("config", 0x5865F2),
+                )
+            )
+
+        # Display in ladder order if available, then any extras
+        ordered_ids = [rid for rid in rank_order if rid in rank_perks]
+        unordered_ids = [rid for rid in rank_perks if rid not in rank_order]
+        display_ids = ordered_ids + unordered_ids
+
+        lines = []
+        for rid in display_ids:
+            perks = rank_perks[rid]
+            perk_str = " ".join(f"<@&{p}>" for p in perks)
+            lines.append(f"<@&{rid}> → {perk_str}")
+
+        embed = discord.Embed(
+            title="🎖️ Rank Tier Perks",
+            description="\n".join(lines),
+            color=COLORS.get("config", 0x5865F2),
+        )
+        embed.set_footer(text=f"Use {ctx.prefix}modstaff setranktier @rank @perk1 @perk2 to edit")
+        await ctx.send(embed=embed)
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @modstaff_group.command(name="showconfig")
     async def showconfig(self, ctx: commands.Context):
         """
@@ -1594,6 +1905,18 @@ class ModStaff(commands.Cog, name="ModStaff"):
             embed.add_field(name="🪜 Rank Ladder (low → high)", value=ladder_lines, inline=False)
         else:
             embed.add_field(name="🪜 Rank Ladder", value="Not configured — set with `?modstaff setrankorder`", inline=False)
+
+        rank_perks = cfg.get("rank_perks", {})
+        if rank_perks:
+            ordered_ids = [rid for rid in rank_order if rid in rank_perks]
+            unordered_ids = [rid for rid in rank_perks if rid not in rank_order]
+            tier_lines = []
+            for rid in ordered_ids + unordered_ids:
+                perk_str = " ".join(f"<@&{p}>" for p in rank_perks[rid])
+                tier_lines.append(f"<@&{rid}> → {perk_str}")
+            embed.add_field(name="🎖️ Rank Tier Perks", value="\n".join(tier_lines), inline=False)
+        else:
+            embed.add_field(name="🎖️ Rank Tier Perks", value="Not configured — set with `?modstaff setranktier`", inline=False)
 
         custom_colors = cfg.get("embed_colors", {})
         if custom_colors:
