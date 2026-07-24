@@ -112,10 +112,26 @@ class ModStaff(commands.Cog, name="ModStaff"):
     async def _bump_staff_stat(
         self, guild_id: int, moderator_id: int, action: str
     ):
-        """Increment a moderation stat counter for a staff member."""
+        """
+        Increment a moderation stat counter for a staff member.
+
+        last_active is written to BOTH staff_stats and staff_data so that
+        whichever document the stats embed reads from, the value is current.
+        """
+        now = time.time()
+        # Primary stats document
         await self.db.find_one_and_update(
             {"type": "staff_stats", "guild_id": str(guild_id), "user_id": str(moderator_id)},
-            {"$inc": {f"moderation.{action}": 1}, "$set": {"last_active": time.time()}},
+            {
+                "$inc": {f"moderation.{action}": 1},
+                "$set": {"last_active": now},
+            },
+            upsert=True,
+        )
+        # Mirror last_active into staff_data so the embed always has it
+        await self.db.find_one_and_update(
+            {"type": "staff_data", "guild_id": str(guild_id), "user_id": str(moderator_id)},
+            {"$set": {"last_active": now}},
             upsert=True,
         )
 
@@ -139,6 +155,28 @@ class ModStaff(commands.Cog, name="ModStaff"):
             {"type": "config", "guild_id": str(guild_id)}
         )
         return doc or {}
+
+    async def _get_next_lower_role(
+        self, guild: discord.Guild, role: discord.Role
+    ) -> Optional[discord.Role]:
+        """
+        Given a role being removed during a demotion, return the next lower
+        role in the configured rank ladder, or None if not configured / at bottom.
+
+        The rank_order list is stored lowest → highest.
+        """
+        cfg = await self._get_config(guild.id)
+        rank_order = cfg.get("rank_order", [])  # list of role id strings, low → high
+        if not rank_order:
+            return None
+        try:
+            idx = rank_order.index(str(role.id))
+        except ValueError:
+            return None
+        if idx == 0:
+            return None  # already at the bottom
+        lower_id = rank_order[idx - 1]
+        return guild.get_role(int(lower_id))
 
     async def _save_config(self, guild_id: int, updates: dict):
         """Upsert plugin configuration for this guild."""
@@ -205,6 +243,64 @@ class ModStaff(commands.Cog, name="ModStaff"):
             return True
         except (discord.Forbidden, discord.HTTPException):
             return False
+
+    async def _is_staff_member(self, guild_id: int, member: discord.Member) -> bool:
+        """Return True if the member holds any configured staff role."""
+        cfg = await self._get_config(guild_id)
+        staff_role_ids = cfg.get("staff_role_ids", [])
+        if not staff_role_ids:
+            return False
+        member_role_ids = {str(r.id) for r in member.roles}
+        return bool(member_role_ids.intersection(staff_role_ids))
+
+    # ===========================================================================
+    # Message tracking listener
+    # ===========================================================================
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        """
+        Track messages sent by staff members in guild channels.
+
+        Increments tickets.messages_sent in staff_stats for every non-bot
+        message a staff member sends in a guild text channel or thread.
+        This powers the 'Messages Sent' counter shown in ?staffstats.
+        """
+        # Ignore DMs, bots, and system messages
+        if not message.guild or message.author.bot or not message.content:
+            return
+
+        member = message.guild.get_member(message.author.id)
+        if member is None:
+            return
+
+        # Only track messages from configured staff members
+        if not await self._is_staff_member(message.guild.id, member):
+            return
+
+        now = time.time()
+        await self.db.find_one_and_update(
+            {
+                "type": "staff_stats",
+                "guild_id": str(message.guild.id),
+                "user_id": str(message.author.id),
+            },
+            {
+                "$inc": {"tickets.messages_sent": 1},
+                "$set": {"last_active": now},
+            },
+            upsert=True,
+        )
+        # Mirror last_active to staff_data too
+        await self.db.find_one_and_update(
+            {
+                "type": "staff_data",
+                "guild_id": str(message.guild.id),
+                "user_id": str(message.author.id),
+            },
+            {"$set": {"last_active": now}},
+            upsert=True,
+        )
 
     # ===========================================================================
     # Moderation commands
@@ -407,7 +503,6 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "kick")
 
         embed = action_embed("kick", ctx.author, member, reason, case_id, guild_name=ctx.guild.name)
-        # Patch the DM embed's case id (was 0 before we had the case id)
         await ctx.send(embed=embed)
         await self._send_log(ctx.guild, embed)
 
@@ -607,6 +702,87 @@ class ModStaff(commands.Cog, name="ModStaff"):
         view.message = msg
 
     # ===========================================================================
+    # Delete case command
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.command(name="delcase", aliases=["deletecase", "removecase", "expunge"])
+    async def delcase(self, ctx: commands.Context, case_id: int):
+        """
+        Remove a moderation case from the history by its case number.
+
+        Usage: `?delcase <case_id>`
+        Use `?history @user` to find the case number.
+        """
+        case = await self.db.find_one(
+            {"type": "case", "guild_id": str(ctx.guild.id), "case_id": case_id}
+        )
+        if not case:
+            return await ctx.send(
+                embed=error_embed("Case Not Found", f"No case `#{case_id}` was found in this server.")
+            )
+
+        action = case.get("action", "unknown")
+        user_id = case.get("user_id", "?")
+        mod_id = case.get("moderator_id", "?")
+        reason = case.get("reason", "No reason provided.")
+        ts = case.get("timestamp", 0)
+        date_str = format_dt(ts) if ts else "Unknown date"
+
+        emoji = ACTION_EMOJIS.get(action, "🔧")
+        confirm_embed = discord.Embed(
+            title=f"🗑️ Delete Case #{case_id}?",
+            description=(
+                f"{emoji} **Action:** {action.capitalize()}\n"
+                f"**Target:** <@{user_id}>\n"
+                f"**Moderator:** <@{mod_id}>\n"
+                f"**Reason:** {reason}\n"
+                f"**Date:** {date_str}\n\n"
+                "⚠️ This cannot be undone."
+            ),
+            color=COLORS["delcase"],
+        )
+        confirm_embed.set_footer(text="This will permanently remove the case from all records.")
+
+        view = ConfirmView(author_id=ctx.author.id, timeout=30.0)
+        msg = await ctx.send(embed=confirm_embed, view=view)
+        view.message = msg
+        await view.wait()
+
+        if view.value is None:
+            return await msg.edit(embed=error_embed("Timed Out", "Case deletion cancelled."), view=view)
+        if not view.value:
+            return await msg.edit(embed=error_embed("Cancelled", "Case deletion cancelled."), view=view)
+
+        await self.db.delete_one(
+            {"type": "case", "guild_id": str(ctx.guild.id), "case_id": case_id}
+        )
+
+        result = discord.Embed(
+            title=f"🗑️ Case #{case_id} Deleted",
+            description=(
+                f"Case **#{case_id}** ({action.capitalize()} on <@{user_id}>) "
+                f"has been permanently removed.\n**Deleted by:** {ctx.author.mention}"
+            ),
+            color=COLORS["success"],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        await msg.edit(embed=result, view=view)
+
+        log_embed = discord.Embed(
+            title=f"🗑️ Case #{case_id} Deleted",
+            description=(
+                f"**Original Action:** {emoji} {action.capitalize()}\n"
+                f"**Original Target:** <@{user_id}>\n"
+                f"**Original Reason:** {reason}\n"
+                f"**Deleted by:** {ctx.author.mention} (`{ctx.author.id}`)"
+            ),
+            color=COLORS["delcase"],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        await self._send_log(ctx.guild, log_embed)
+
+    # ===========================================================================
     # Promote command
     # ===========================================================================
 
@@ -625,6 +801,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         Usage: `?promote @user @role [reason]`
 
+        If staff roles are configured, the target role must be one of them.
         Requires ADMINISTRATOR permission level or a configured manager role.
         """
         cfg = await self._get_config(ctx.guild.id)
@@ -637,6 +814,19 @@ class ModStaff(commands.Cog, name="ModStaff"):
                         "You need a configured manager role to use this command.",
                     )
                 )
+
+        # Only enforce the staff-role whitelist when it has been configured.
+        # This allows promote to work freely until the server admin sets it up.
+        staff_role_ids = cfg.get("staff_role_ids", [])
+        if staff_role_ids and str(role.id) not in staff_role_ids:
+            return await ctx.send(
+                embed=error_embed(
+                    "Not a Staff Role",
+                    f"{role.mention} is not in the configured staff role list.\n"
+                    f"Add it with `{ctx.prefix}modstaff setstaffrole {role.mention}` first, "
+                    f"or leave staff roles unconfigured to allow any role.",
+                )
+            )
 
         if role >= ctx.author.top_role and ctx.author.id != ctx.guild.owner_id:
             return await ctx.send(
@@ -687,13 +877,20 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         now_ts = time.time()
 
-        # Record promotion in database
+        # Update staff_data.
+        # IMPORTANT: $setOnInsert only fires when the document is first created.
+        # This means staff_since is preserved for existing staff members (re-promotions,
+        # rank changes) — only set on their very first promotion.
+        # We also store last_active here so the embed always has it regardless of
+        # which document the stats embed reads from.
         await self.db.find_one_and_update(
             {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
             {
                 "$set": {
                     "current_rank": role.name,
+                    "current_rank_id": str(role.id),
                     "rank_since": now_ts,
+                    "last_active": now_ts,
                 },
                 "$setOnInsert": {"staff_since": now_ts},
                 "$push": {
@@ -708,7 +905,18 @@ class ModStaff(commands.Cog, name="ModStaff"):
             },
             upsert=True,
         )
+
+        # Update stats for the PROMOTER (their "promotions performed" count).
+        # The PROMOTEE's own moderation stats are untouched — nothing resets.
         await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "promote")
+
+        # Also touch the promotee's staff_stats last_active so their profile
+        # is marked as recently active.
+        await self.db.find_one_and_update(
+            {"type": "staff_stats", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+            {"$set": {"last_active": now_ts}},
+            upsert=True,
+        )
 
         case_id = await self._insert_case(ctx.guild.id, member.id, ctx.author.id, "promote", reason)
 
@@ -752,9 +960,12 @@ class ModStaff(commands.Cog, name="ModStaff"):
         reason: str = "No reason provided.",
     ):
         """
-        Demote a member by removing a staff role with optional replacement.
+        Demote a member by removing a staff role.
 
         Usage: `?demote @user @role [@replacement_role] [reason]`
+
+        If a rank ladder is configured via `?modstaff setrankorder`, the next
+        lower role is assigned automatically when no replacement is specified.
         """
         cfg = await self._get_config(ctx.guild.id)
         manager_roles = cfg.get("manager_role_ids", [])
@@ -772,11 +983,13 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 embed=error_embed("Role Not Found", f"{member.mention} does not have the role **{role.name}**.")
             )
 
-        desc = (
-            f"Are you sure you want to demote {member.mention} by removing **{role.name}**?"
-        )
+        # Auto-detect replacement from rank ladder if none provided
+        if replacement_role is None:
+            replacement_role = await self._get_next_lower_role(ctx.guild, role)
+
+        desc = f"Are you sure you want to demote {member.mention} by removing **{role.name}**?"
         if replacement_role:
-            desc += f"\nThey will be assigned **{replacement_role.name}** instead."
+            desc += f"\nThey will automatically be assigned **{replacement_role.name}** (next rank down)."
         desc += f"\n\n**Reason:** {reason}"
 
         confirm_embed = discord.Embed(
@@ -803,7 +1016,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         try:
             await member.remove_roles(role, reason=f"[Demotion] {reason} | Mod: {ctx.author}")
             if replacement_role:
-                await member.add_roles(replacement_role, reason="Demotion replacement role")
+                await member.add_roles(replacement_role, reason="Demotion — next rank down")
         except discord.Forbidden:
             return await msg.edit(
                 embed=error_embed("Missing Permissions", "I cannot modify this member's roles."),
@@ -818,6 +1031,12 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await self.db.find_one_and_update(
             {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
             {
+                "$set": {
+                    "current_rank": replacement_role.name if replacement_role else "None",
+                    "current_rank_id": str(replacement_role.id) if replacement_role else None,
+                    "rank_since": now_ts,
+                    "last_active": now_ts,
+                },
                 "$push": {
                     "demotions": {
                         "role_removed": role.name,
@@ -837,7 +1056,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         extra = [("📉 Role Removed", role.mention, True)]
         if replacement_role:
-            extra.append(("🔄 Replacement Role", replacement_role.mention, True))
+            extra.append(("🔄 New Role", replacement_role.mention, True))
 
         result_embed = action_embed(
             "demote", ctx.author, member, reason, case_id,
@@ -847,7 +1066,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await msg.edit(embed=result_embed, view=view)
         await self._send_log(ctx.guild, result_embed)
 
-        # Optional DM notification
+        # DM notification
         dm_embed = discord.Embed(
             title=f"📉 Staff Update in {ctx.guild.name}",
             description=(
@@ -858,6 +1077,159 @@ class ModStaff(commands.Cog, name="ModStaff"):
             color=COLORS["demote"],
             timestamp=datetime.now(tz=timezone.utc),
         )
+        await self._try_dm(member, dm_embed)
+
+    # ===========================================================================
+    # Termination command
+    # ===========================================================================
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.command(name="termination", aliases=["terminate", "fire"])
+    async def termination(
+        self,
+        ctx: commands.Context,
+        member: discord.Member,
+        *,
+        reason: str = "No reason provided.",
+    ):
+        """
+        Terminate a staff member — removes ALL configured staff roles at once.
+
+        Usage: `?termination @user [reason]`
+
+        Requires a configured manager role (if set) or ADMINISTRATOR level.
+        All staff roles defined via `?modstaff setstaffrole` are removed.
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        manager_roles = cfg.get("manager_role_ids", [])
+        if manager_roles:
+            if not await self._check_role_permission(ctx, manager_roles):
+                return await ctx.send(
+                    embed=error_embed(
+                        "Insufficient Permissions",
+                        "You need a configured manager role to use this command.",
+                    )
+                )
+
+        # Gather all configured staff roles the member currently has
+        staff_role_ids = cfg.get("staff_role_ids", [])
+        if not staff_role_ids:
+            return await ctx.send(
+                embed=error_embed(
+                    "No Staff Roles Configured",
+                    "No staff roles have been configured yet.\n"
+                    f"Use `{ctx.prefix}modstaff setstaffrole @role` to add them first.",
+                )
+            )
+
+        roles_to_remove = [
+            r for r in member.roles
+            if str(r.id) in staff_role_ids
+        ]
+
+        if not roles_to_remove:
+            return await ctx.send(
+                embed=error_embed(
+                    "No Staff Roles Found",
+                    f"{member.mention} does not hold any of the configured staff roles.",
+                )
+            )
+
+        roles_list = ", ".join(f"**{r.name}**" for r in roles_to_remove)
+
+        confirm_embed = discord.Embed(
+            title="🚫 Confirm Staff Termination",
+            description=(
+                f"You are about to **terminate** {member.mention}.\n\n"
+                f"**Roles to be removed:**\n{roles_list}\n\n"
+                f"**Reason:** {reason}\n\n"
+                "⚠️ This will remove **all** staff roles from this member."
+            ),
+            color=COLORS["termination"],
+        )
+        confirm_embed.set_thumbnail(url=getattr(member.display_avatar, "url", None))
+        confirm_embed.set_footer(text="This action will be logged and stored.")
+
+        view = ConfirmView(author_id=ctx.author.id, timeout=30.0)
+        msg = await ctx.send(embed=confirm_embed, view=view)
+        view.message = msg
+        await view.wait()
+
+        if view.value is None:
+            return await msg.edit(embed=error_embed("Timed Out", "Termination cancelled."), view=view)
+        if not view.value:
+            return await msg.edit(embed=error_embed("Cancelled", "Termination cancelled."), view=view)
+
+        try:
+            await member.remove_roles(*roles_to_remove, reason=f"[Termination] {reason} | Mod: {ctx.author}")
+        except discord.Forbidden:
+            return await msg.edit(
+                embed=error_embed("Missing Permissions", "I cannot remove roles from this member."),
+                view=view,
+            )
+        except discord.HTTPException as e:
+            return await msg.edit(embed=error_embed("Discord Error", str(e)), view=view)
+
+        now_ts = time.time()
+
+        # Record in staff_data
+        await self.db.find_one_and_update(
+            {"type": "staff_data", "guild_id": str(ctx.guild.id), "user_id": str(member.id)},
+            {
+                "$set": {"current_rank": "Terminated", "current_rank_id": None, "last_active": now_ts},
+                "$push": {
+                    "demotions": {
+                        "role_removed": "ALL STAFF ROLES",
+                        "roles": [str(r.id) for r in roles_to_remove],
+                        "replacement": None,
+                        "demoted_by": str(ctx.author.id),
+                        "reason": f"[TERMINATION] {reason}",
+                        "timestamp": now_ts,
+                    }
+                },
+            },
+            upsert=True,
+        )
+        await self._bump_staff_stat(ctx.guild.id, ctx.author.id, "demote")
+
+        case_id = await self._insert_case(
+            ctx.guild.id, member.id, ctx.author.id, "termination", reason
+        )
+
+        result_embed = discord.Embed(
+            title=f"🚫 Staff Terminated | Case #{case_id}",
+            color=COLORS["termination"],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        result_embed.add_field(
+            name="👤 Member", value=f"{member.mention} (`{member.id}`)", inline=True
+        )
+        result_embed.add_field(
+            name="🛡️ Terminated By", value=f"{ctx.author.mention}", inline=True
+        )
+        result_embed.add_field(
+            name="📋 Reason", value=reason, inline=False
+        )
+        result_embed.add_field(
+            name="🗑️ Roles Removed", value=roles_list, inline=False
+        )
+        result_embed.set_thumbnail(url=getattr(member.display_avatar, "url", None))
+        result_embed.set_footer(text=ctx.guild.name)
+
+        await msg.edit(embed=result_embed, view=view)
+        await self._send_log(ctx.guild, result_embed)
+
+        # DM the terminated member
+        dm_embed = discord.Embed(
+            title=f"🚫 You have been terminated from {ctx.guild.name}",
+            description=(
+                f"All of your staff roles have been removed.\n\n"
+                f"**Reason:** {reason}"
+            ),
+            color=COLORS["termination"],
+            timestamp=datetime.now(tz=timezone.utc),
+        )
+        dm_embed.set_thumbnail(url=ctx.guild.icon.url if ctx.guild.icon else None)
         await self._try_dm(member, dm_embed)
 
     # ===========================================================================
@@ -876,11 +1248,20 @@ class ModStaff(commands.Cog, name="ModStaff"):
 
         Usage: `?staffstats [@user]`
         Defaults to the command author if no user is specified.
+
+        Shows current rank, time in rank, staff since, last active,
+        tickets handled, messages sent, moderation action counts,
+        and full role promotion/demotion history.
         """
         target = member or ctx.author
 
         staff_doc = await self._get_staff_doc(ctx.guild.id, target.id)
         stats_doc = await self._get_stats_doc(ctx.guild.id, target.id)
+
+        # Merge last_active: prefer staff_stats (most up-to-date), fall back to staff_data
+        if not stats_doc.get("last_active") and staff_doc.get("last_active"):
+            stats_doc = dict(stats_doc)
+            stats_doc["last_active"] = staff_doc["last_active"]
 
         embed = stats_embed(target, ctx.guild, staff_doc, stats_doc)
         await ctx.send(embed=embed)
@@ -900,8 +1281,6 @@ class ModStaff(commands.Cog, name="ModStaff"):
         docs = await cursor.to_list(length=None)
 
         entries = []
-        now = time.time()
-        month_start = now - 30 * 86400  # last 30 days approximation
 
         for doc in docs:
             m = doc.get("moderation", {})
@@ -921,10 +1300,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
             elif category == "messages":
                 score = t.get("messages_sent", 0)
             elif category == "monthly":
-                # For monthly, we sum actions from the last 30 days using case records
-                # This is an approximation using stored data; a full monthly breakdown
-                # would require per-timestamp indexes.
-                score = mod_total  # fallback — monthly tracking requires extra collection
+                score = mod_total  # fallback — full monthly tracking requires per-timestamp indexing
             else:
                 score = 0
 
@@ -954,7 +1330,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         """
         Display the interactive staff leaderboard.
 
-        Navigate between categories (Overall, Tickets, Moderation, Monthly)
+        Navigate between categories (Overall, Tickets, Moderation, Messages)
         and pages using the buttons below the embed.
 
         Usage: `?staffleaderboard`
@@ -986,7 +1362,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         ModStaff plugin configuration.
 
         Run `?modstaff` to see this help message.
-        Subcommands: setlog, setcolor, setstaffrole, setmanager, help
+        Subcommands: setlog, setcolor, setstaffrole, setmanager, setrankorder, showconfig, help
         """
         prefix = ctx.prefix
         embed = discord.Embed(
@@ -1001,6 +1377,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"`{prefix}modstaff setcolor <action> <hex>` — Set embed color for an action\n"
                 f"`{prefix}modstaff setstaffrole <@role>` — Add/remove a staff role\n"
                 f"`{prefix}modstaff setmanager <@role>` — Add/remove a manager role\n"
+                f"`{prefix}modstaff setrankorder <@role1> <@role2> ...` — Set rank ladder (low → high)\n"
                 f"`{prefix}modstaff showconfig` — Show current plugin configuration\n"
                 f"`{prefix}modstaff help` — Show this message"
             ),
@@ -1093,6 +1470,43 @@ class ModStaff(commands.Cog, name="ModStaff"):
         await ctx.send(embed=success_embed("Manager Role Updated", msg))
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="setrankorder")
+    async def setrankorder(self, ctx: commands.Context, *roles: discord.Role):
+        """
+        Set the staff rank ladder used for automatic demotion role assignment.
+
+        Provide roles in order from LOWEST to HIGHEST rank.
+
+        Usage: `?modstaff setrankorder @TrialMod @Moderator @SeniorMod @Admin`
+
+        When `?demote` is used and no replacement role is specified, the plugin
+        will automatically assign the next lower role in this ladder.
+        Example: demoting a Senior Moderator → automatically assigns Moderator.
+
+        Run with no roles to clear the ladder.
+        """
+        if not roles:
+            await self._save_config(ctx.guild.id, {"rank_order": []})
+            return await ctx.send(embed=success_embed("Rank Ladder Cleared", "The rank ladder has been cleared."))
+
+        role_ids = [str(r.id) for r in roles]
+        await self._save_config(ctx.guild.id, {"rank_order": role_ids})
+
+        ladder_display = "\n".join(
+            f"`{i + 1}.` {r.mention}" for i, r in enumerate(roles)
+        )
+        embed = discord.Embed(
+            title="🪜 Rank Ladder Configured",
+            description=(
+                f"Demotion will now automatically assign the next role down.\n\n"
+                f"**Order (lowest → highest):**\n{ladder_display}"
+            ),
+            color=COLORS["success"],
+        )
+        embed.set_footer(text="Use ?demote @user @role — the lower role is assigned automatically.")
+        await ctx.send(embed=embed)
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @modstaff_group.command(name="showconfig")
     async def showconfig(self, ctx: commands.Context):
         """
@@ -1108,7 +1522,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         staff_role_ids = cfg.get("staff_role_ids", [])
         staff_roles = ", ".join(
             f"<@&{r}>" for r in staff_role_ids
-        ) or "None configured"
+        ) or "None configured (any role can be used in ?promote)"
 
         manager_role_ids = cfg.get("manager_role_ids", [])
         manager_roles = ", ".join(
@@ -1122,6 +1536,15 @@ class ModStaff(commands.Cog, name="ModStaff"):
         embed.add_field(name="📋 Log Channel", value=log_ch, inline=False)
         embed.add_field(name="👥 Staff Roles", value=staff_roles, inline=False)
         embed.add_field(name="🔑 Manager Roles", value=manager_roles, inline=False)
+
+        rank_order = cfg.get("rank_order", [])
+        if rank_order:
+            ladder_lines = "\n".join(
+                f"`{i + 1}.` <@&{r_id}>" for i, r_id in enumerate(rank_order)
+            )
+            embed.add_field(name="🪜 Rank Ladder (low → high)", value=ladder_lines, inline=False)
+        else:
+            embed.add_field(name="🪜 Rank Ladder", value="Not configured — set with `?modstaff setrankorder`", inline=False)
 
         custom_colors = cfg.get("embed_colors", {})
         if custom_colors:
