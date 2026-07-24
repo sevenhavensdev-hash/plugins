@@ -1180,8 +1180,22 @@ class ModStaff(commands.Cog, name="ModStaff"):
         if not view.value:
             return await msg.edit(embed=error_embed("Cancelled", "Demotion was cancelled."), view=view)
 
+        # When demoting to plain member (no replacement), also strip team + dept roles
+        extra_remove_on_full_demote: list[discord.Role] = []
+        if replacement_role is None:
+            _team_id = cfg.get("staff_team_role_id")
+            _team_r = ctx.guild.get_role(int(_team_id)) if _team_id else None
+            if _team_r and _team_r in member.roles:
+                extra_remove_on_full_demote.append(_team_r)
+            _staff_doc = await self._get_staff_doc(ctx.guild.id, member.id)
+            _dept_id = _staff_doc.get("dept_role_id")
+            _dept_r = ctx.guild.get_role(int(_dept_id)) if _dept_id else None
+            if _dept_r and _dept_r in member.roles:
+                extra_remove_on_full_demote.append(_dept_r)
+
         try:
-            await member.remove_roles(role, reason=f"[Demotion] {reason} | Mod: {ctx.author}")
+            roles_to_remove = [role] + extra_remove_on_full_demote
+            await member.remove_roles(*roles_to_remove, reason=f"[Demotion] {reason} | Mod: {ctx.author}")
             if replacement_role:
                 await member.add_roles(replacement_role, reason="Demotion — next rank down")
         except discord.Forbidden:
@@ -1191,6 +1205,10 @@ class ModStaff(commands.Cog, name="ModStaff"):
             )
         except discord.HTTPException as e:
             return await msg.edit(embed=error_embed("Discord Error", str(e)), view=view)
+
+        # Clear dept_role_id in staff_data if we stripped the dept role
+        if extra_remove_on_full_demote and any(r == _dept_r for r in extra_remove_on_full_demote if '_dept_r' in dir()):
+            pass  # handled below in the $set block
 
         # Apply rank perks (LR/MR/department roles etc.)
         perks_added, perks_removed = await self._apply_rank_perks(
@@ -1208,6 +1226,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
                     "current_rank_id": str(replacement_role.id) if replacement_role else None,
                     "rank_since": now_ts,
                     "last_active": now_ts,
+                    **({"dept_role_id": None} if not replacement_role and extra_remove_on_full_demote else {}),
                 },
                 "$push": {
                     "demotions": {
@@ -1229,6 +1248,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
         extra = [("📉 Role Removed", role.mention, True)]
         if replacement_role:
             extra.append(("🔄 New Role", replacement_role.mention, True))
+        if extra_remove_on_full_demote:
+            extra.append(("🗑️ Also Removed", " ".join(r.mention for r in extra_remove_on_full_demote), False))
         if perks_added:
             extra.append(("➕ Perks Added", " ".join(r.mention for r in perks_added), False))
         if perks_removed:
@@ -1899,6 +1920,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
             )
         )
 
+
     # ===========================================================================
     # setdept — per-member department role command
     # ===========================================================================
@@ -1971,7 +1993,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
             )
             await ctx.send(embed=embed)
             await self._send_log(ctx.guild, discord.Embed(
-                title="🏢 Department Role Removed",
+                title="\U0001f3e2 Department Role Removed",
                 description=(
                     f"**Member:** {member.mention} (`{member.id}`)\n"
                     f"**Role Removed:** {current_dept.mention}\n"
@@ -2013,7 +2035,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
         embed = success_embed("Department Role Set", desc)
         await ctx.send(embed=embed)
         await self._send_log(ctx.guild, discord.Embed(
-            title="🏢 Department Role Assigned",
+            title="\U0001f3e2 Department Role Assigned",
             description=(
                 f"**Member:** {member.mention} (`{member.id}`)\n"
                 f"**Role:** {role.mention}\n"
