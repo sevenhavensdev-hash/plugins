@@ -740,7 +740,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"**Date:** {date_str}\n\n"
                 "⚠️ This cannot be undone."
             ),
-            color=COLORS["delcase"],
+            color=COLORS.get("delcase", 0xFF4444),
         )
         confirm_embed.set_footer(text="This will permanently remove the case from all records.")
 
@@ -777,7 +777,7 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"**Original Reason:** {reason}\n"
                 f"**Deleted by:** {ctx.author.mention} (`{ctx.author.id}`)"
             ),
-            color=COLORS["delcase"],
+            color=COLORS.get("delcase", 0xFF4444),
             timestamp=datetime.now(tz=timezone.utc),
         )
         await self._send_log(ctx.guild, log_embed)
@@ -1377,7 +1377,8 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"`{prefix}modstaff setcolor <action> <hex>` — Set embed color for an action\n"
                 f"`{prefix}modstaff setstaffrole <@role>` — Add/remove a staff role\n"
                 f"`{prefix}modstaff setmanager <@role>` — Add/remove a manager role\n"
-                f"`{prefix}modstaff setrankorder <@role1> <@role2> ...` — Set rank ladder (low → high)\n"
+                f"`{prefix}modstaff setrankorder [@role1 @role2 ...]` — Set/view rank ladder (low → high)\n"
+                f"`{prefix}modstaff clearrankorder` — Remove the rank ladder\n"
                 f"`{prefix}modstaff showconfig` — Show current plugin configuration\n"
                 f"`{prefix}modstaff help` — Show this message"
             ),
@@ -1483,11 +1484,34 @@ class ModStaff(commands.Cog, name="ModStaff"):
         will automatically assign the next lower role in this ladder.
         Example: demoting a Senior Moderator → automatically assigns Moderator.
 
-        Run with no roles to clear the ladder.
+        Run with no roles to view the current ladder.
+        Use `?modstaff clearrankorder` to remove the ladder entirely.
         """
         if not roles:
-            await self._save_config(ctx.guild.id, {"rank_order": []})
-            return await ctx.send(embed=success_embed("Rank Ladder Cleared", "The rank ladder has been cleared."))
+            # Show current rank order instead of clearing
+            cfg = await self._get_config(ctx.guild.id)
+            rank_order = cfg.get("rank_order", [])
+            if not rank_order:
+                return await ctx.send(
+                    embed=discord.Embed(
+                        title="🪜 Rank Ladder",
+                        description=(
+                            "No rank ladder is configured.\n\n"
+                            f"Set one with `{ctx.prefix}modstaff setrankorder @role1 @role2 ...` (lowest → highest)."
+                        ),
+                        color=COLORS.get("config", 0x5865F2),
+                    )
+                )
+            ladder_display = "\n".join(
+                f"`{i + 1}.` <@&{r_id}>" for i, r_id in enumerate(rank_order)
+            )
+            embed = discord.Embed(
+                title="🪜 Current Rank Ladder",
+                description=f"**Order (lowest → highest):**\n{ladder_display}",
+                color=COLORS.get("config", 0x5865F2),
+            )
+            embed.set_footer(text=f"To change: {ctx.prefix}modstaff setrankorder @role1 @role2 ... | To clear: {ctx.prefix}modstaff clearrankorder")
+            return await ctx.send(embed=embed)
 
         role_ids = [str(r.id) for r in roles]
         await self._save_config(ctx.guild.id, {"rank_order": role_ids})
@@ -1501,10 +1525,24 @@ class ModStaff(commands.Cog, name="ModStaff"):
                 f"Demotion will now automatically assign the next role down.\n\n"
                 f"**Order (lowest → highest):**\n{ladder_display}"
             ),
-            color=COLORS["success"],
+            color=COLORS.get("success", 0x57F287),
         )
         embed.set_footer(text="Use ?demote @user @role — the lower role is assigned automatically.")
         await ctx.send(embed=embed)
+
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @modstaff_group.command(name="clearrankorder")
+    async def clearrankorder(self, ctx: commands.Context):
+        """
+        Remove the configured staff rank ladder entirely.
+
+        Usage: `?modstaff clearrankorder`
+        """
+        cfg = await self._get_config(ctx.guild.id)
+        if not cfg.get("rank_order"):
+            return await ctx.send(embed=error_embed("Nothing to Clear", "No rank ladder is currently configured."))
+        await self._save_config(ctx.guild.id, {"rank_order": []})
+        await ctx.send(embed=success_embed("Rank Ladder Cleared", "The rank ladder has been removed."))
 
     @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
     @modstaff_group.command(name="showconfig")
