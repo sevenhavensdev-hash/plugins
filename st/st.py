@@ -79,7 +79,7 @@ class StaffTitles(commands.Cog):
 
     @staticmethod
     def _is_name_character(character: str) -> bool:
-        """Allow letters and numbers from any language, but no symbols."""
+        """Allow letters, numbers, and periods, but no decorative symbols."""
         category = unicodedata.category(character)
         return category.startswith(("L", "N"))
 
@@ -90,7 +90,7 @@ class StaffTitles(commands.Cog):
         pending_space = False
 
         for character in cls._strip_managed_prefix(name):
-            if cls._is_name_character(character):
+            if cls._is_name_character(character) or character == ".":
                 if pending_space and cleaned:
                     cleaned.append(" ")
                 cleaned.append(character)
@@ -109,13 +109,20 @@ class StaffTitles(commands.Cog):
         if name != name.strip() or any(
             character.isspace() and character != " " for character in name
         ):
-            return "Use letters, numbers, and single spaces only."
+            return "Use letters, numbers, periods, and single spaces only."
 
         if "  " in name:
             return "Use only one space between words."
 
-        if not all(cls._is_name_character(character) or character == " " for character in name):
-            return "Symbols are not allowed. Use letters, numbers, and spaces only."
+        if not all(
+            cls._is_name_character(character)
+            or character in {" ", "."}
+            for character in name
+        ):
+            return (
+                "Decorative symbols such as ★, @, and # are not allowed. "
+                "Periods are allowed."
+            )
 
         if len(name) > cls.MAX_NICKNAME_LENGTH:
             return f"Your name must be {cls.MAX_NICKNAME_LENGTH} characters or fewer."
