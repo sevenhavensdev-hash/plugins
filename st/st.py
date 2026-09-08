@@ -8,6 +8,7 @@ can be used without hard-coding a server's IDs into the repository.
 import logging
 import os
 import unicodedata
+from pathlib import Path
 from typing import Optional
 
 import discord
@@ -42,12 +43,42 @@ class StaffTitles(commands.Cog):
             )
 
     @staticmethod
-    def _load_role_prefixes() -> dict[int, str]:
+    def _read_plugin_env() -> dict[str, str]:
+        """Read simple KEY=value entries from the plugin's optional .env file."""
+        env_path = Path(__file__).with_name(".env")
+        if not env_path.exists():
+            return {}
+
+        values: dict[str, str] = {}
+        try:
+            lines = env_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            log.exception("Unable to read the StaffTitles .env file.")
+            return {}
+
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            if key:
+                values[key] = value
+
+        return values
+
+    @classmethod
+    def _load_role_prefixes(cls) -> dict[int, str]:
         """Read one or more comma-separated Discord role IDs per rank."""
         configured: dict[int, str] = {}
+        plugin_env = cls._read_plugin_env()
 
-        for env_name, prefix in StaffTitles.ROLE_LEVELS:
-            raw_value = os.getenv(env_name, "")
+        for env_name, prefix in cls.ROLE_LEVELS:
+            # The bot's real environment wins; the plugin-local .env is a
+            # convenient fallback for GitHub-hosted plugins.
+            raw_value = os.getenv(env_name) or plugin_env.get(env_name, "")
             for raw_role_id in raw_value.split(","):
                 raw_role_id = raw_role_id.strip()
                 if not raw_role_id:
@@ -79,7 +110,7 @@ class StaffTitles(commands.Cog):
 
     @staticmethod
     def _is_name_character(character: str) -> bool:
-        """Allow letters, numbers, and periods, but no decorative symbols."""
+        """Allow letters, numbers, periods, and commas, but no decorative symbols."""
         category = unicodedata.category(character)
         return category.startswith(("L", "N"))
 
@@ -90,7 +121,7 @@ class StaffTitles(commands.Cog):
         pending_space = False
 
         for character in cls._strip_managed_prefix(name):
-            if cls._is_name_character(character) or character == ".":
+            if cls._is_name_character(character) or character in {".", ","}:
                 if pending_space and cleaned:
                     cleaned.append(" ")
                 cleaned.append(character)
@@ -109,19 +140,19 @@ class StaffTitles(commands.Cog):
         if name != name.strip() or any(
             character.isspace() and character != " " for character in name
         ):
-            return "Use letters, numbers, periods, and single spaces only."
+            return "Use letters, numbers, periods, commas, and single spaces only."
 
         if "  " in name:
             return "Use only one space between words."
 
         if not all(
             cls._is_name_character(character)
-            or character in {" ", "."}
+            or character in {" ", ".", ","}
             for character in name
         ):
             return (
                 "Decorative symbols such as ★, @, and # are not allowed. "
-                "Periods are allowed."
+                "Periods and commas are allowed."
             )
 
         if len(name) > cls.MAX_NICKNAME_LENGTH:
