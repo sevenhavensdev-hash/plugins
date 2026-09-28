@@ -1,0 +1,1 @@
+"""Staff Strike Modmail plugin package."""
