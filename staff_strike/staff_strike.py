@@ -10,4 +10,5 @@ async def setup(bot: commands.Bot) -> None:
     """Load Staff Strike without duplicating an existing Staff Manager."""
     if bot.get_cog("Staff Manager") is None:
         await bot.add_cog(StaffManagerCog(bot))
-    await bot.add_cog(ModerationCog(bot))
+    if bot.get_cog("Staff Strike Moderation") is None:
+        await bot.add_cog(ModerationCog(bot))
