@@ -690,6 +690,52 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         embed.add_field(name="Reason", value=record["reason"], inline=False)
         await ctx.send(embed=embed)
 
+    async def _notify_user(self, target: discord.abc.User, record: dict) -> bool:
+        """Best-effort DM notification for a newly applied punishment."""
+        action = str(record.get("action", "moderation"))
+        guild_id = str(record.get("guild_id", ""))
+        guild = self.bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
+        guild_name = guild.name if guild else "the server"
+        label = MODERATION_LABELS.get(action, action.title())
+
+        if action == "softban":
+            description = (
+                f"You received a softban in **{guild_name}**. "
+                "Your recent messages may have been removed."
+            )
+        else:
+            description = f"You received a **{label.lower()}** in **{guild_name}**."
+
+        embed = discord.Embed(
+            title=f"{MODERATION_ICONS.get(action, '⚠️')}  Moderation Notice",
+            description=description,
+            color=MODERATION_COLORS.get(action, 0x5865F2),
+            timestamp=_now(),
+        )
+        embed.add_field(name="Reason", value=record["reason"], inline=False)
+        expires = _parse_iso(record.get("expires_at"))
+        if expires:
+            embed.add_field(
+                name="Duration",
+                value=f"Until {ts(expires, 'F')} ({ts(expires, 'R')})",
+                inline=False,
+            )
+        elif action in {"mute", "ban"}:
+            embed.add_field(name="Duration", value="Permanent", inline=False)
+        embed.add_field(name="Case", value=f"`{record['case_id']}`", inline=True)
+        embed.add_field(
+            name="Moderator",
+            value=f"<@{record['moderator_id']}>",
+            inline=True,
+        )
+        embed.set_footer(text="Staff Strike moderation system")
+
+        try:
+            await target.send(embed=embed)
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+        return True
+
     async def _remove_case(
         self, case_id: str, *, delete_log: bool = False
     ) -> Optional[dict]:
@@ -847,6 +893,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         record = self._base_record(user, ctx.author, "warn", reason)
         self._append_record(user, record)
         await self._post_log(record, ctx)
+        await self._notify_user(user, record)
         await self._confirmation(ctx, record, f"{user.mention} has been warned.")
 
     @commands.command(name="mute", aliases=["timeout"])
@@ -885,6 +932,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         record = self._base_record(member, ctx.author, "mute", reason, expires)
         self._append_record(member, record)
         await self._post_log(record, ctx)
+        await self._notify_user(member, record)
         await self._confirmation(
             ctx, record, f"{member.mention} has been timed out for **{format_duration(duration)}**."
         )
@@ -919,6 +967,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         record = self._base_record(member, ctx.author, "softban", reason)
         record["active"] = False
         await self._post_log(record, ctx)
+        await self._notify_user(member, record)
         await self._confirmation(
             ctx,
             record,
@@ -968,6 +1017,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
             }
             _save(ACTIVE_BANS_FILE, active_bans)
         await self._post_log(record, ctx)
+        await self._notify_user(user, record)
         duration_description = (
             f" for **{format_duration(duration)}**" if duration else " permanently"
         )
