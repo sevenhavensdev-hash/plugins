@@ -38,9 +38,6 @@ import discord
 from discord import ui
 from discord.ext import commands, tasks
 
-from core import checks
-from core.models import PermissionLevel
-
 # ---------------------------------------------------------------------------
 # Constants & file paths
 # ---------------------------------------------------------------------------
@@ -321,7 +318,18 @@ def ts(dt: datetime, style: str = "F") -> str:
 # Config — reads from config.json in the same folder as this file
 # ---------------------------------------------------------------------------
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(_PACKAGE_DIR, "config.json")
+if not os.path.exists(CONFIG_FILE):
+    # The fallback also supports the timestamped config filename used when
+    # source files are uploaded as attachments.
+    _config_snapshots = sorted(
+        name
+        for name in os.listdir(_PACKAGE_DIR)
+        if name.startswith("config") and name.endswith(".json")
+    )
+    if _config_snapshots:
+        CONFIG_FILE = os.path.join(_PACKAGE_DIR, _config_snapshots[0])
 
 def _load_config() -> dict:
     if os.path.exists(CONFIG_FILE):
@@ -331,6 +339,57 @@ def _load_config() -> dict:
         except (json.JSONDecodeError, OSError):
             pass
     return {}
+
+
+STAFF_ROLE_KEYS = (
+    "TRIAL_MODERATOR_ROLE_ID",
+    "MODERATOR_ROLE_ID",
+    "SENIOR_MODERATOR_ROLE_ID",
+    "STAFF_MANAGEMENT_ROLE_ID",
+    "HEAD_OF_STAFF_ROLE_ID",
+    "ADMIN_ROLE_ID",
+    "HEAD_ADMIN_ROLE_ID",
+)
+STAFF_ADMIN_ROLE_KEYS = (
+    "STAFF_MANAGEMENT_ROLE_IDS",
+    "HIGH_RANK_ROLE_IDS",
+    "STAFF_MANAGEMENT_ROLE_ID",
+    "HEAD_OF_STAFF_ROLE_ID",
+    "ADMIN_ROLE_ID",
+    "HEAD_ADMIN_ROLE_ID",
+)
+
+
+def _configured_ids(*keys: str) -> set[int]:
+    """Read configured user or role IDs for standalone bot permission checks."""
+    config = _load_config()
+    result: set[int] = set()
+    for key in keys:
+        value = config.get(key)
+        if isinstance(value, list):
+            result.update(int(item) for item in value if str(item).isdigit())
+        elif isinstance(value, int) and value:
+            result.add(value)
+    return result
+
+
+def staff_moderator_check(ctx: commands.Context) -> bool:
+    """Allow configured staff members to use staff-management commands."""
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
+        return False
+    user_ids = _configured_ids("STAFF_IDS")
+    role_ids = _configured_ids(*STAFF_ROLE_KEYS)
+    return ctx.author.id in user_ids or bool(
+        {role.id for role in ctx.author.roles} & role_ids
+    )
+
+
+def staff_admin_check(ctx: commands.Context) -> bool:
+    """Allow Staff Management and higher to use administrative commands."""
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
+        return False
+    role_ids = _configured_ids(*STAFF_ADMIN_ROLE_KEYS)
+    return bool({role.id for role in ctx.author.roles} & role_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -1821,7 +1880,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     # ------------------------------------------------------------------ #
 
     @commands.command(name="inactivityreq", aliases=["loa", "loareq"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def inactivity_request(
         self, ctx: commands.Context, duration: str, *, reason: str
     ) -> None:
@@ -1935,7 +1994,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             pass
 
     @commands.command(name="promotionreq", aliases=["promote", "promoapp"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def promotion_request(self, ctx: commands.Context, *, reason: str) -> None:
         """
         Submit a promotion request.
@@ -2044,7 +2103,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             pass
 
     @commands.command(name="modlog")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def manual_mod_log(
         self,
         ctx: commands.Context,
@@ -2096,7 +2155,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.message.add_reaction("✅")
 
     @commands.command(name="staffstats")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def staff_stats(
         self,
         ctx: commands.Context,
@@ -2192,7 +2251,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=pages[0], view=view)
 
     @commands.command(name="staffactivity", aliases=["activityreport", "weeklyreport"])
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.check(staff_admin_check)
     async def staff_activity(
         self,
         ctx: commands.Context,
@@ -2248,7 +2307,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             await ch.send(embed=page)
 
     @commands.command(name="modlogdelete", aliases=["delmodlog", "deletemodlog", "modlogdel"])
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.check(staff_admin_check)
     async def modlog_delete(
         self,
         ctx: commands.Context,
@@ -2359,7 +2418,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=confirm, delete_after=15)
 
     @commands.command(name="modlogreset", aliases=["resetmodlog", "clearmodlog", "modlogclear"])
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.check(staff_admin_check)
     async def modlog_reset(
         self,
         ctx: commands.Context,
@@ -2432,7 +2491,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=embed, delete_after=20)
 
     @commands.command(name="modstatsreset", aliases=["resetstats", "clearstats", "statsreset"])
-    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    @commands.check(staff_admin_check)
     async def modstats_reset(
         self,
         ctx: commands.Context,
@@ -2479,7 +2538,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=embed, delete_after=20)
 
     @commands.command(name="staffleaderboard", aliases=["leaderboard", "lb", "topmods"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def staff_leaderboard(
         self,
         ctx: commands.Context,
