@@ -17,9 +17,6 @@ import discord
 from discord import ui
 from discord.ext import commands, tasks
 
-from core import checks
-from core.models import PermissionLevel
-
 from .staff_manager import (
     ACTION_COLORS,
     ACTION_ICONS,
@@ -37,7 +34,22 @@ from .staff_manager import (
 BASE_DIR = __import__("os").path.dirname(__import__("os").path.abspath(__file__))
 HISTORY_FILE = __import__("os").path.join(BASE_DIR, "data", "moderation_history.json")
 ACTIVE_BANS_FILE = __import__("os").path.join(BASE_DIR, "data", "active_bans.json")
-CONFIG_FILE = __import__("os").path.join(BASE_DIR, "config.json")
+
+
+def _config_file() -> str:
+    """Find the normal config file, including uploaded snapshot filenames."""
+    import os
+
+    normal = os.path.join(BASE_DIR, "config.json")
+    if os.path.exists(normal):
+        return normal
+    for filename in sorted(os.listdir(BASE_DIR)):
+        if filename.startswith("config") and filename.endswith(".json"):
+            return os.path.join(BASE_DIR, filename)
+    return normal
+
+
+CONFIG_FILE = _config_file()
 
 MAX_TIMEOUT = timedelta(days=28)
 SOFTBAN_DELETE_SECONDS = 7 * 24 * 60 * 60
@@ -126,6 +138,33 @@ def _cfg_ids(*keys: str) -> set[int]:
                 if item.strip().isdigit()
             )
     return result
+
+
+def staff_moderator_check(ctx: commands.Context) -> bool:
+    """Allow configured staff members to use moderation commands.
+
+    Modmail's built-in PermissionLevel check is not aware of the role IDs in
+    this plugin's config.json.  Using the configured roles here keeps the
+    moderation cog consistent with the rest of Staff Strike.
+    """
+    if not ctx.guild or not isinstance(ctx.author, discord.Member):
+        return False
+
+    configured_staff_users = _cfg_ids("STAFF_IDS")
+    configured_staff_roles = _cfg_ids(
+        "TRIAL_MODERATOR_ROLE_ID",
+        "MODERATOR_ROLE_ID",
+        "SENIOR_MODERATOR_ROLE_ID",
+        "STAFF_MANAGEMENT_ROLE_ID",
+        "HEAD_OF_STAFF_ROLE_ID",
+        "ADMIN_ROLE_ID",
+        "HEAD_ADMIN_ROLE_ID",
+    )
+    member_role_ids = {role.id for role in ctx.author.roles}
+    return (
+        ctx.author.id in configured_staff_users
+        or bool(member_role_ids & configured_staff_roles)
+    )
 
 
 def _now() -> datetime:
@@ -399,6 +438,68 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
 
     async def cog_unload(self) -> None:
         self.expire_punishments.cancel()
+
+    async def cog_command_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
+        """Give staff a useful response instead of silently swallowing errors."""
+        error = getattr(error, "original", error)
+
+        if isinstance(error, commands.CheckFailure):
+            embed = discord.Embed(
+                title="Moderation command denied",
+                description=(
+                    "You need one of the configured Staff Strike staff roles "
+                    "to use this command."
+                ),
+                color=0xE74C3C,
+                timestamp=_now(),
+            )
+        elif isinstance(error, commands.MissingRequiredArgument):
+            embed = discord.Embed(
+                title="Missing command argument",
+                description=(
+                    f"Add the `{error.param.name}` argument and try again.\n"
+                    f"Use `{ctx.prefix}help {ctx.command.qualified_name}` "
+                    "for the full format."
+                ),
+                color=0xE67E22,
+                timestamp=_now(),
+            )
+        elif isinstance(error, commands.BadArgument):
+            embed = discord.Embed(
+                title="Invalid command argument",
+                description=(
+                    "I could not understand one of the arguments. Mention the "
+                    "member directly, then try again."
+                ),
+                color=0xE67E22,
+                timestamp=_now(),
+            )
+        elif isinstance(error, discord.Forbidden):
+            embed = discord.Embed(
+                title="Moderation action blocked",
+                description=(
+                    "I do not have the Discord permission required for that "
+                    "action, or my role is below the target."
+                ),
+                color=0xE74C3C,
+                timestamp=_now(),
+            )
+        elif isinstance(error, discord.HTTPException):
+            embed = discord.Embed(
+                title="Moderation action failed",
+                description=(
+                    "Discord rejected that action. Check the bot permissions "
+                    "and try again."
+                ),
+                color=0xE74C3C,
+                timestamp=_now(),
+            )
+        else:
+            raise error
+
+        await ctx.send(embed=embed, delete_after=12)
 
     def _history(self) -> dict:
         return _load(HISTORY_FILE)
@@ -679,7 +780,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         description: Optional[str] = None,
     ) -> None:
         embed = discord.Embed(
-            title=f"{MODERATION_ICONS.get(record['action'], '•')}  {MODERATION_LABELS.get(record['action'], record['action'].title())}",
+            title=f"{MODERATION_ICONS.get(record['action'], '•')}  Moderation complete",
             description=description
             or f"Case `{record['case_id']}` has been recorded.",
             color=MODERATION_COLORS.get(record["action"], 0x5865F2),
@@ -687,7 +788,12 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
         embed.add_field(name="Target", value=f"<@{record['user_id']}>", inline=True)
         embed.add_field(name="Case", value=f"`{record['case_id']}`", inline=True)
-        embed.add_field(name="Reason", value=record["reason"], inline=False)
+        embed.add_field(
+            name=MODERATION_LABELS.get(record["action"], "Action"),
+            value=record["reason"],
+            inline=False,
+        )
+        embed.set_footer(text="Staff Strike")
         await ctx.send(embed=embed)
 
     async def _notify_user(self, target: discord.abc.User, record: dict) -> bool:
@@ -835,7 +941,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         await self.bot.wait_until_ready()
 
     @commands.command(name="history")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def history(self, ctx: commands.Context, target: str) -> None:
         """Show one moderation case per page for a user."""
         if not ctx.guild:
@@ -851,7 +957,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
     @commands.command(name="warnings", aliases=["warns"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def warnings(self, ctx: commands.Context, target: str) -> None:
         """Show active warnings with per-warning remove buttons."""
         user = await self._resolve_user(ctx, target)
@@ -876,7 +982,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
     @commands.command(name="warn")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def warn(self, ctx: commands.Context, target: str, *, reason: str) -> None:
         """Warn a member and create a warning case."""
         if not ctx.guild:
@@ -897,7 +1003,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         await self._confirmation(ctx, record, f"{user.mention} has been warned.")
 
     @commands.command(name="mute", aliases=["timeout"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def mute(self, ctx: commands.Context, target: str, *, details: str) -> None:
         """Timeout a member. The final token is the duration."""
         member = await self._target_member(ctx, target)
@@ -938,7 +1044,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
     @commands.command(name="softban")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def softban(self, ctx: commands.Context, target: str, *, reason: str) -> None:
         """Ban and immediately unban a member, deleting up to Discord's seven-day message limit."""
         if not ctx.guild:
@@ -975,7 +1081,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
     @commands.command(name="ban")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def ban(self, ctx: commands.Context, target: str, *, details: str) -> None:
         """Ban a user permanently or temporarily; an optional final token is the duration."""
         if not ctx.guild:
@@ -1026,7 +1132,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
     @commands.command(name="unmute", aliases=["untimeout"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def unmute(self, ctx: commands.Context, target: str) -> None:
         """Remove a member's timeout and log the reversal."""
         member = await self._target_member(ctx, target)
@@ -1056,7 +1162,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         await self._confirmation(ctx, record, f"{member.mention} is no longer timed out.")
 
     @commands.command(name="unban")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def unban(self, ctx: commands.Context, target: str) -> None:
         """Remove a server ban and log the reversal."""
         if not ctx.guild:
@@ -1108,7 +1214,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         await self._confirmation(ctx, record, f"{user} has been unbanned.")
 
     @commands.command(name="unwarn", aliases=["delwarn", "removewarn"])
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def unwarn(
         self, ctx: commands.Context, target: str, warning_id: str
     ) -> None:
@@ -1141,7 +1247,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
     @commands.command(name="delhistory")
-    @checks.has_permissions(PermissionLevel.MODERATOR)
+    @commands.check(staff_moderator_check)
     async def delete_history(self, ctx: commands.Context, history_message_id: int) -> None:
         """Delete a history case using the message ID of its moderation log."""
         history = self._history()
