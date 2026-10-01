@@ -27,6 +27,7 @@ from .staff_manager import (
     parse_duration,
     record_staff_action,
     remove_staff_action,
+    _parse_dyno_embed,
     ts,
 )
 
@@ -53,7 +54,7 @@ CONFIG_FILE = _config_file()
 
 MAX_TIMEOUT = timedelta(days=28)
 SOFTBAN_DELETE_SECONDS = 7 * 24 * 60 * 60
-HISTORY_ACTIONS = {"warn", "mute", "ban", "unmute", "unban"}
+HISTORY_ACTIONS = {"warn", "mute", "kick", "softban", "ban", "unmute", "unban"}
 STAFF_MANAGEMENT_CONFIG_KEYS = (
     "STAFF_MANAGEMENT_ROLE_IDS",
     "HIGH_RANK_ROLE_IDS",
@@ -76,6 +77,7 @@ STAFF_ROLE_CONFIG_KEYS = (
 MODERATION_COLORS = {
     "warn": 0xF1C40F,
     "mute": 0xE67E22,
+    "kick": 0xE74C3C,
     "softban": 0xC0392B,
     "ban": 0x992D22,
     "unmute": 0x2ECC71,
@@ -84,6 +86,7 @@ MODERATION_COLORS = {
 MODERATION_ICONS = {
     "warn": "⚠️",
     "mute": "🔇",
+    "kick": "👟",
     "softban": "🪃",
     "ban": "🔨",
     "unmute": "🔊",
@@ -92,6 +95,7 @@ MODERATION_ICONS = {
 MODERATION_LABELS = {
     "warn": "Warning",
     "mute": "Timeout",
+    "kick": "Kick",
     "softban": "Softban",
     "ban": "Ban",
     "unmute": "Timeout Removed",
@@ -666,9 +670,18 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
             embed.add_field(name="Duration", value=status, inline=False)
         elif action in {"mute", "ban"}:
             embed.add_field(name="Duration", value="Permanent", inline=False)
+        if record.get("source_log_url"):
+            embed.add_field(
+                name="Original Dyno log",
+                value=f"[Open source message]({record['source_log_url']})",
+                inline=False,
+            )
         state = "Active" if record.get("active", True) else "Removed"
         embed.set_footer(
-            text=f"{state} • Log message: {record.get('log_message_id') or 'not posted'}"
+            text=(
+                f"{state} • Log message: "
+                f"{record.get('log_message_id') or record.get('source_log_message_id') or 'not posted'}"
+            )
         )
         return embed
 
@@ -939,6 +952,264 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
     @expire_punishments.before_loop
     async def _before_expiry(self) -> None:
         await self.bot.wait_until_ready()
+
+    @commands.command(name="transferdyno")
+    @commands.check(staff_management_check)
+    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
+    async def transfer_dyno_history(self, ctx: commands.Context) -> None:
+        """Import recognized Dyno moderation actions into user histories."""
+        if not ctx.guild:
+            return
+
+        channel_id = _cfg_int("DYNO_MOD_LOG_CHANNEL")
+        dyno_id = _cfg_int("DYNO_ID")
+        if not channel_id:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Dyno transfer is not configured",
+                    description=(
+                        "Set `DYNO_MOD_LOG_CHANNEL` in "
+                        "`bot/staff_strike/config.json` to the staff logs channel ID."
+                    ),
+                    color=0xE67E22,
+                    timestamp=_now(),
+                )
+            )
+            return
+        if not dyno_id:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Dyno transfer is not configured",
+                    description="Set `DYNO_ID` to the Dyno bot's user ID.",
+                    color=0xE67E22,
+                    timestamp=_now(),
+                )
+            )
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except discord.NotFound:
+                channel = None
+            except discord.Forbidden:
+                channel = None
+            except discord.HTTPException:
+                channel = None
+        if not isinstance(channel, discord.TextChannel):
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Staff logs channel unavailable",
+                    description=(
+                        "I could not access the configured text channel. Check the ID "
+                        "and make sure I can view the channel and read its history."
+                    ),
+                    color=0xE74C3C,
+                    timestamp=_now(),
+                )
+            )
+            return
+        if channel.guild.id != ctx.guild.id:
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Staff logs channel is in another server",
+                    description=(
+                        "The configured Dyno logs channel must belong to the same "
+                        "server where `.transferdyno` is run."
+                    ),
+                    color=0xE74C3C,
+                    timestamp=_now(),
+                )
+            )
+            return
+
+        initial_history = self._history()
+        imported_keys = {
+            str(record.get("source_log_key"))
+            for records in initial_history.values()
+            for record in records
+            if record.get("source_log_key")
+        }
+        pending_records: list[dict] = []
+        counters = {
+            "scanned": 0,
+            "imported": 0,
+            "duplicates": 0,
+            "unrecognized": 0,
+            "unmatched_targets": 0,
+            "non_dyno": 0,
+        }
+        status = await ctx.send(
+            embed=discord.Embed(
+                title="Dyno history transfer started",
+                description=f"Reading moderation logs from {channel.mention} oldest first.",
+                color=0x5865F2,
+                timestamp=_now(),
+            )
+        )
+
+        def progress_embed(title: str, color: int) -> discord.Embed:
+            return discord.Embed(
+                title=title,
+                description=(
+                    f"Messages scanned: **{counters['scanned']:,}**\n"
+                    f"Imported: **{counters['imported']:,}** • "
+                    f"Already imported: **{counters['duplicates']:,}**\n"
+                    f"Non-Dyno messages ignored: **{counters['non_dyno']:,}** • "
+                    f"Other/unrecognized logs ignored: **{counters['unrecognized']:,}**\n"
+                    f"Could not match a target user: **{counters['unmatched_targets']:,}**"
+                ),
+                color=color,
+                timestamp=_now(),
+            )
+
+        def flush_pending_records() -> None:
+            """Merge each checkpoint into the latest on-disk history."""
+            if not pending_records:
+                return
+            latest_history = self._history()
+            next_case_number = int(self._next_case_id().split("-", 1)[1])
+            for pending_record in pending_records:
+                pending_record["case_id"] = f"SS-{next_case_number:06d}"
+                latest_history.setdefault(
+                    str(pending_record["user_id"]), []
+                ).append(pending_record)
+                next_case_number += 1
+            _save(HISTORY_FILE, latest_history)
+            pending_records.clear()
+
+        try:
+            async for message in channel.history(limit=None, oldest_first=True):
+                counters["scanned"] += 1
+                if counters["scanned"] % 250 == 0:
+                    try:
+                        await status.edit(
+                            embed=progress_embed("Dyno history transfer running", 0x5865F2)
+                        )
+                    except discord.HTTPException:
+                        pass
+
+                if message.author.id != dyno_id:
+                    counters["non_dyno"] += 1
+                    continue
+
+                for embed_index, embed in enumerate(message.embeds):
+                    parsed = _parse_dyno_embed(embed)
+                    if not parsed or parsed.get("action") not in HISTORY_ACTIONS:
+                        counters["unrecognized"] += 1
+                        continue
+
+                    source_key = f"{message.id}:{embed_index}"
+                    if source_key in imported_keys:
+                        counters["duplicates"] += 1
+                        continue
+
+                    target_id = parsed.get("user_id")
+                    target_tag = str(parsed.get("user_tag") or "").strip()
+                    if not target_id and target_tag:
+                        possible_ids = {
+                            member.id
+                            for member in ctx.guild.members
+                            if target_tag.casefold()
+                            in {
+                                str(member).casefold(),
+                                member.name.casefold(),
+                                member.display_name.casefold(),
+                            }
+                        }
+                        if len(possible_ids) == 1:
+                            target_id = possible_ids.pop()
+
+                    if not target_id:
+                        counters["unmatched_targets"] += 1
+                        continue
+
+                    target_id = int(target_id)
+                    target_member = ctx.guild.get_member(target_id)
+                    target_user = self.bot.get_user(target_id)
+                    moderator_id = parsed.get("moderator_id")
+                    moderator_tag = str(parsed.get("moderator") or "").strip()
+                    if not moderator_id and moderator_tag:
+                        possible_mod_ids = {
+                            member.id
+                            for member in ctx.guild.members
+                            if moderator_tag.casefold()
+                            in {
+                                str(member).casefold(),
+                                member.name.casefold(),
+                                member.display_name.casefold(),
+                            }
+                        }
+                        if len(possible_mod_ids) == 1:
+                            moderator_id = possible_mod_ids.pop()
+
+                    if moderator_id:
+                        moderator_id = int(moderator_id)
+                        moderator_user = (
+                            ctx.guild.get_member(moderator_id)
+                            or self.bot.get_user(moderator_id)
+                        )
+                        if moderator_user:
+                            moderator_tag = str(moderator_user)
+                    else:
+                        moderator_id = 0
+                        moderator_tag = moderator_tag or "Unknown"
+
+                    action = str(parsed["action"])
+                    record = {
+                        "schema_version": 1,
+                        "case_id": "",
+                        "action": action,
+                        "user_id": str(target_id),
+                        "user_tag": (
+                            str(target_user or target_member)
+                            if target_user or target_member
+                            else target_tag or f"User {target_id}"
+                        ),
+                        "moderator_id": str(moderator_id),
+                        "moderator_tag": moderator_tag,
+                        "reason": _reason_text(
+                            str(parsed.get("reason") or "No reason provided.")
+                        ),
+                        "created_at": message.created_at.isoformat(),
+                        "expires_at": None,
+                        "active": action not in {"softban", "kick"},
+                        "guild_id": str(ctx.guild.id),
+                        "log_channel_id": None,
+                        "log_message_id": None,
+                        "log_url": None,
+                        "source_log_message_id": str(message.id),
+                        "source_log_embed_index": embed_index,
+                        "source_log_key": source_key,
+                        "source_log_channel_id": str(channel.id),
+                        "source_log_url": message.jump_url,
+                        "imported_from": "Dyno",
+                    }
+                    pending_records.append(record)
+                    imported_keys.add(source_key)
+                    counters["imported"] += 1
+
+                    # Checkpoint the JSON store periodically so a long transfer
+                    # can be resumed without repeating already imported cases.
+                    if counters["imported"] % 25 == 0:
+                        flush_pending_records()
+
+        except discord.Forbidden:
+            flush_pending_records()
+            await status.edit(
+                embed=progress_embed("Transfer stopped: channel access denied", 0xE74C3C)
+            )
+            return
+        except discord.HTTPException:
+            flush_pending_records()
+            await status.edit(
+                embed=progress_embed("Transfer stopped: Discord request failed", 0xE74C3C)
+            )
+            return
+
+        flush_pending_records()
+        await status.edit(embed=progress_embed("Dyno history transfer complete", 0x2ECC71))
 
     @commands.command(name="history")
     @commands.check(staff_moderator_check)
