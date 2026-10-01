@@ -6,7 +6,6 @@ Moderation records are JSON-backed because Modmail plugins do not own a
 database.  The stored schema is versioned and keeps enough information to
 rebuild an audit trail after a restart.
 """
-
 from __future__ import annotations
 
 import re
