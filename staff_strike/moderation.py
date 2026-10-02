@@ -978,10 +978,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
     async def _before_expiry(self) -> None:
         await self.bot.wait_until_ready()
 
-    @commands.command(name="transferdyno")
-    @commands.check(staff_management_check)
-    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
-    async def transfer_dyno_history(self, ctx: commands.Context) -> None:
+    async def _transfer_dyno_history(self, ctx: commands.Context) -> None:
         """Import recognized Dyno moderation actions into user histories."""
         if not ctx.guild:
             return
@@ -1620,5 +1617,25 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         )
 
 
+class DynoTransferCog(commands.Cog, name="Staff Strike Dyno Transfer"):
+    """Register the Dyno importer independently of moderation cog conflicts."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self._moderation = ModerationCog(bot)
+
+    @commands.command(name="transferdyno")
+    @commands.check(staff_management_check)
+    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
+    async def transfer_dyno_history(self, ctx: commands.Context) -> None:
+        await self._moderation._transfer_dyno_history(ctx)
+
+    async def cog_command_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
+        await self._moderation.cog_command_error(ctx, error)
+
+
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(ModerationCog(bot))
+    await bot.add_cog(DynoTransferCog(bot))
