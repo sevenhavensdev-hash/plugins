@@ -1622,18 +1622,27 @@ class DynoTransferCog(commands.Cog, name="Staff Strike Dyno Transfer"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._moderation = ModerationCog(bot)
+
+    def _moderation_cog(self):
+        return self.bot.get_cog("Staff Strike Moderation")
 
     @commands.command(name="transferdyno")
     @commands.check(staff_management_check)
     @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
     async def transfer_dyno_history(self, ctx: commands.Context) -> None:
-        await self._moderation._transfer_dyno_history(ctx)
+        moderation = self._moderation_cog()
+        if moderation is None:
+            raise commands.CommandError("Staff Strike Moderation is not loaded.")
+        await moderation._transfer_dyno_history(ctx)
 
     async def cog_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
-        await self._moderation.cog_command_error(ctx, error)
+        moderation = self._moderation_cog()
+        if moderation is not None:
+            await moderation.cog_command_error(ctx, error)
+        else:
+            await ctx.send("Staff Strike Moderation is not loaded.")
 
 
 async def setup(bot: commands.Bot) -> None:
