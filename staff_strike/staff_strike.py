@@ -2,7 +2,7 @@
 
 from discord.ext import commands
 
-from .moderation import ModerationCog
+from .moderation import DynoTransferCog, ModerationCog
 from .staff_manager import StaffManagerCog
 
 
@@ -12,3 +12,9 @@ async def setup(bot: commands.Bot) -> None:
         await bot.add_cog(StaffManagerCog(bot))
     if bot.get_cog("Staff Strike Moderation") is None:
         await bot.add_cog(ModerationCog(bot))
+    if bot.get_cog("Staff Strike Dyno Transfer") is None:
+        await bot.add_cog(DynoTransferCog(bot))
+    if bot.get_command("transferdyno") is None:
+        raise RuntimeError(
+            "Staff Strike loaded without registering the transferdyno command."
+        )
