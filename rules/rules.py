@@ -4,12 +4,58 @@ from discord.ext import commands
 import discord
 
 
+RULE_PAGE_LABELS = (
+    "Overview",
+    "Minor",
+    "Medium",
+    "Extreme",
+    "Voice",
+    "In-game",
+)
+
+
+class RulesPageButton(discord.ui.Button):
+    def __init__(self, page_index, label, row):
+        super().__init__(
+            label=label,
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"age_civilisations_rules:page:{page_index}",
+            row=row,
+        )
+        self.page_index = page_index
+
+    async def callback(self, interaction):
+        view = RulesView(current_page=self.page_index)
+        embed = AgeOfCivilisationsRules._build_embeds()[self.page_index]
+        await interaction.response.edit_message(embed=embed, view=view)
+
+
+class RulesView(discord.ui.View):
+    """Persistent section buttons for the rules message."""
+
+    def __init__(self, current_page=0):
+        super().__init__(timeout=None)
+        for page_index, label in enumerate(RULE_PAGE_LABELS):
+            button = RulesPageButton(
+                page_index=page_index,
+                label=label,
+                row=0 if page_index < 3 else 1,
+            )
+            if page_index == current_page:
+                button.style = discord.ButtonStyle.primary
+            self.add_item(button)
+
+
 class AgeOfCivilisationsRules(commands.Cog):
     """Publish the server rules in a channel configured by a server manager."""
 
     def __init__(self, bot):
         self.bot = bot
         self.collection = bot.api.get_plugin_partition(self)
+
+    async def cog_load(self):
+        # Re-register the persistent custom IDs after the bot restarts.
+        self.bot.add_view(RulesView())
 
     @commands.command(name="ruleschannel")
     @commands.guild_only()
@@ -43,35 +89,12 @@ class AgeOfCivilisationsRules(commands.Cog):
             )
             return
 
-        embeds = self._build_embeds()
-        # Keep each post within Discord's combined embed limit if rules are edited.
-        batches = []
-        batch = []
-        batch_length = 0
-        for embed in embeds:
-            embed_length = self._embed_text_length(embed)
-            if batch and (batch_length + embed_length > 6000 or len(batch) == 10):
-                batches.append(batch)
-                batch = []
-                batch_length = 0
-            batch.append(embed)
-            batch_length += embed_length
-        if batch:
-            batches.append(batch)
-
-        for batch in batches:
-            await channel.send(embeds=batch)
+        await channel.send(
+            embed=self._build_embeds()[0],
+            view=RulesView(),
+        )
 
         await ctx.send(f"Rules posted in {channel.mention}.", delete_after=8)
-
-    @staticmethod
-    def _embed_text_length(embed):
-        length = len(embed.title or "") + len(embed.description or "")
-        length += len(embed.footer.text or "") if embed.footer else 0
-        length += len(embed.author.name or "") if embed.author else 0
-        for field in embed.fields:
-            length += len(field.name) + len(field.value)
-        return length
 
     @staticmethod
     def _build_embeds():
@@ -210,7 +233,11 @@ class AgeOfCivilisationsRules(commands.Cog):
                 color=0x3498DB,
             ),
         ]
-        embeds[-1].set_footer(text="Keep the community fair, safe, and welcoming.")
+        for page_number, embed in enumerate(embeds, start=1):
+            embed.set_footer(
+                text=f"Section {page_number} of {len(embeds)} • "
+                "Use the buttons to switch sections."
+            )
         return embeds
 
 
