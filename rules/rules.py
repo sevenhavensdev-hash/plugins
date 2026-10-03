@@ -5,19 +5,20 @@ import discord
 
 
 RULE_PAGE_LABELS = (
-    "Overview",
-    "Minor",
-    "Medium",
-    "Extreme",
-    "Voice",
-    "In-game",
+    ("Overview", "🌷"),
+    ("Minor", "🍃"),
+    ("Medium", "🌼"),
+    ("Extreme", "🚨"),
+    ("Voice", "🎧"),
+    ("In-game", "🎮"),
 )
 
 
 class RulesPageButton(discord.ui.Button):
-    def __init__(self, page_index, label, row):
+    def __init__(self, page_index, label, emoji, row):
         super().__init__(
             label=label,
+            emoji=emoji,
             style=discord.ButtonStyle.secondary,
             custom_id=f"age_civilisations_rules:page:{page_index}",
             row=row,
@@ -31,19 +32,45 @@ class RulesPageButton(discord.ui.Button):
 
 
 class RulesView(discord.ui.View):
-    """Persistent section buttons for the rules message."""
+    """Persistent section buttons for a member's private rules view."""
 
     def __init__(self, current_page=0):
         super().__init__(timeout=None)
-        for page_index, label in enumerate(RULE_PAGE_LABELS):
+        for page_index, (label, emoji) in enumerate(RULE_PAGE_LABELS):
             button = RulesPageButton(
                 page_index=page_index,
                 label=label,
+                emoji=emoji,
                 row=0 if page_index < 3 else 1,
             )
             if page_index == current_page:
                 button.style = discord.ButtonStyle.primary
             self.add_item(button)
+
+
+class OpenRulesButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="Open my rules",
+            emoji="📖",
+            style=discord.ButtonStyle.primary,
+            custom_id="age_civilisations_rules:open",
+        )
+
+    async def callback(self, interaction):
+        await interaction.response.send_message(
+            embed=AgeOfCivilisationsRules._build_embeds()[0],
+            view=RulesView(),
+            ephemeral=True,
+        )
+
+
+class RulesLauncher(discord.ui.View):
+    """Persistent public button that opens a private rules browser."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(OpenRulesButton())
 
 
 class AgeOfCivilisationsRules(commands.Cog):
@@ -54,7 +81,8 @@ class AgeOfCivilisationsRules(commands.Cog):
         self.collection = bot.api.get_plugin_partition(self)
 
     async def cog_load(self):
-        # Re-register the persistent custom IDs after the bot restarts.
+        # Re-register persistent custom IDs so old posts still work after restarts.
+        self.bot.add_view(RulesLauncher())
         self.bot.add_view(RulesView())
 
     @commands.command(name="ruleschannel")
@@ -89,35 +117,57 @@ class AgeOfCivilisationsRules(commands.Cog):
             )
             return
 
-        await channel.send(
-            embed=self._build_embeds()[0],
-            view=RulesView(),
-        )
+        await channel.send(embed=self._build_landing_embed(), view=RulesLauncher())
 
         await ctx.send(f"Rules posted in {channel.mention}.", delete_after=8)
+
+    @staticmethod
+    def _build_landing_embed():
+        embed = discord.Embed(
+            title="✿  Age of Civilisations  ✿",
+            description=(
+                "Welcome to our little corner of the map! 🌍\n\n"
+                "These guidelines help keep the game fair and the community "
+                "friendly. Press **Open my rules** for your own private, "
+                "button-controlled guide—your browsing won’t change anyone "
+                "else’s view."
+            ),
+            color=0xF7C6D0,
+        )
+        embed.set_author(name="🌸 COMMUNITY GUIDE 🌸")
+        embed.add_field(
+            name="A little guide to everything",
+            value=(
+                "🍃 Minor issues　 ·　 🌼 Medium violations　 ·　 🚨 Serious violations\n"
+                "🎧 Voice chat　 ·　 🎮 Roblox in-game"
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="Be kind • Play fair • Have fun ✨")
+        return embed
 
     @staticmethod
     def _build_embeds():
         embeds = [
             discord.Embed(
-                title="🗺️ Age of Civilisations — Server Rules",
+                title="🌷 Start Here • Community Basics",
                 description=(
-                    "Welcome to the community! These guidelines keep the game fair "
-                    "and the server a good place to hang out. Joining the server and "
-                    "playing the game means you agree to follow them.\n\n"
-                    "**Use common sense:** We can’t write a rule for every scenario. "
-                    "If you’re unsure whether something is against the rules, it "
-                    "probably is—don’t do it.\n\n"
-                    "**Staff discretion:** Moderators may step in when behavior "
+                    "Welcome to the community! These guidelines help keep the game "
+                    "fair and this server a lovely place to hang out. Joining and "
+                    "playing means you agree to follow them. 🌍\n\n"
+                    "🌿 **Use common sense:** We can’t write a rule for every "
+                    "scenario. If you’re unsure whether something is against the "
+                    "rules, it probably is—please don’t do it.\n\n"
+                    "🛡️ **Staff discretion:** Moderators may step in when behavior "
                     "harms the community or disrupts the game, even if that exact "
-                    "situation is not listed below."
+                    "situation isn’t listed here."
                 ),
-                color=0x2A9D8F,
+                color=0xFFC8DD,
             ),
             discord.Embed(
-                title="🟢 Minor Issues — Usually a warning",
+                title="🍃 Minor Issues • Usually a warning",
                 description=(
-                    "These usually result in a quick warning or short mute.\n\n"
+                    "A quick reminder or short mute is usually enough. 🌱\n\n"
                     "• **Use the right channels:** Keep in-game nation discussions, "
                     "roleplay, and lore in their proper channels. Out-of-character "
                     "(OOC) talk belongs in general chat.\n"
@@ -135,12 +185,12 @@ class AgeOfCivilisationsRules(commands.Cog):
                     "avatars must be clean. Disruptive or offensive profile layouts "
                     "must be changed."
                 ),
-                color=0x57F287,
+                color=0xCDEAC0,
             ),
             discord.Embed(
-                title="🟡 Medium Violations — Kick or softban",
+                title="🌼 Medium Violations • Kick or softban",
                 description=(
-                    "These are more serious disruptions that harm the community.\n\n"
+                    "These cause bigger disruptions and can earn a kick or softban. 🌼\n\n"
                     "• **No threats:** Threats are taken seriously, even as a joke; "
                     "more serious threats bring harsher punishments.\n"
                     "• **Keep it SFW:** No explicit, suggestive, or age-inappropriate "
@@ -162,12 +212,12 @@ class AgeOfCivilisationsRules(commands.Cog):
                     "reports, or lying to admins during an investigation can result "
                     "in punishment."
                 ),
-                color=0xFEE75C,
+                color=0xFFE7A3,
             ),
             discord.Embed(
-                title="🔴 Extreme Violations — Immediate permanent ban",
+                title="🚨 Extreme Violations • Permanent ban",
                 description=(
-                    "Crossing these lines means permanent removal from the server.\n\n"
+                    "These serious violations mean immediate, permanent removal. 🚫\n\n"
                     "• **No slurs:** Using any kind of slur results in an immediate, "
                     "permanent ban. No exceptions.\n"
                     "• **No phishing or scams:** Fake links, scams, or attempts to "
@@ -189,10 +239,10 @@ class AgeOfCivilisationsRules(commands.Cog):
                     "and Community Guidelines, and Roblox’s Terms of Service and "
                     "Community Standards. Using Vencord is the only exception."
                 ),
-                color=0xED4245,
+                color=0xFFB4A2,
             ),
             discord.Embed(
-                title="🔊 Voice Chat Rules",
+                title="🎧 Voice Chat Rules",
                 description=(
                     "All text rules apply in voice channels too. Keep voice chat safe "
                     "and appropriate.\n\n"
@@ -211,10 +261,10 @@ class AgeOfCivilisationsRules(commands.Cog):
                     "• **Don’t evade voice mutes:** Using alts to evade a voice mute "
                     "or kick will get all your accounts punished."
                 ),
-                color=0x5865F2,
+                color=0xDCC6F5,
             ),
             discord.Embed(
-                title="🎮 In-Game Rules — Roblox",
+                title="🎮 In-Game Rules • Roblox",
                 description=(
                     "These rules apply directly in the Roblox game. Follow them to "
                     "avoid being kicked or banned in-game.\n\n"
@@ -230,13 +280,13 @@ class AgeOfCivilisationsRules(commands.Cog):
                     "• **Respect staff:** Follow a moderator’s in-game instructions. "
                     "Arguing with staff can get you removed."
                 ),
-                color=0x3498DB,
+                color=0xBDE0FE,
             ),
         ]
         for page_number, embed in enumerate(embeds, start=1):
+            embed.set_author(name="🌸 AGE OF CIVILISATIONS • COMMUNITY GUIDE")
             embed.set_footer(
-                text=f"Section {page_number} of {len(embeds)} • "
-                "Use the buttons to switch sections."
+                text=f"Page {page_number}/{len(embeds)}  ✿  Pick a button to wander"
             )
         return embeds
 
