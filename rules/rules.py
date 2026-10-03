@@ -124,9 +124,9 @@ class AgeOfCivilisationsRules(commands.Cog):
     @staticmethod
     def _build_landing_embed():
         embed = discord.Embed(
-            title="✿  Age of Civilisations  ✿",
+            title="🌍  Age of Civilisations 🌍 ",
             description=(
-                "Welcome to our little corner of the map! 🌍\n\n"
+                "Welcome to the comunnity of civilization! 🌍\n\n"
                 "These guidelines help keep the game fair and the community "
                 "friendly. Press **Open my rules** for your own private, "
                 "button-controlled guide—your browsing won’t change anyone "
@@ -134,9 +134,9 @@ class AgeOfCivilisationsRules(commands.Cog):
             ),
             color=0xF7C6D0,
         )
-        embed.set_author(name="🌸 COMMUNITY GUIDE 🌸")
+        embed.set_author(name=" COMMUNITY GUIDE ")
         embed.add_field(
-            name="A little guide to everything",
+            name="Guidelines",
             value=(
                 "🍃 Minor issues　 ·　 🌼 Medium violations　 ·　 🚨 Serious violations\n"
                 "🎧 Voice chat　 ·　 🎮 Roblox in-game"
