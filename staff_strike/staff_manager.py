@@ -401,8 +401,8 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     """
     Return a dict with action/user_id/user_tag/moderator/moderator_id/reason, or None.
 
-    Searches the embed title, author name, AND description so that Dyno embeds
-    are matched regardless of which field carries the action keyword.
+    Searches the embed title, author name, description, and explicitly named
+    action/type fields so Dyno embeds are matched across common log layouts.
     Returns None for lookup/list embeds (e.g. ?warnings, ?modlogs).
     """
     # Collect all text that might carry the action keyword
@@ -410,9 +410,17 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     author_str = (getattr(embed.author, "name", "") or "").lower()
     desc       = embed.description or ""
     desc_lower = desc.lower()
+    action_field_text = " ".join(
+        f"{field.name or ''} {field.value or ''}"
+        for field in embed.fields
+        if any(
+            keyword in (field.name or "").lower()
+            for keyword in ("action", "type", "punishment", "case type")
+        )
+    ).lower()
 
     # Combined searchable text — checked for keywords
-    full_text = f"{title_str} {author_str} {desc_lower}"
+    full_text = f"{title_str} {author_str} {desc_lower} {action_field_text}"
 
     # --- Exclude lookup / list embeds BEFORE action matching ---
     if _LOOKUP_PATTERNS.search(full_text):
@@ -860,6 +868,15 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             rid = role_map.get(rank)
             if rid and rid in member_role_ids:
                 return rank
+        return None
+
+    def _inactivity_request_rank(self, member: discord.Member) -> Optional[str]:
+        """Return the member's configured rank or the explicit staff allowlist rank."""
+        rank = self._member_rank(member)
+        if rank:
+            return rank
+        if member.id in _configured_ids("STAFF_IDS"):
+            return "Staff"
         return None
 
     def _next_rank(self, current: str) -> Optional[str]:
@@ -1920,7 +1937,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
           !inactivityreq 2w Family emergency
           !inactivityreq 1d12h Mental health break
         """
-        rank = self._member_rank(ctx.author)  # type: ignore[arg-type]
+        rank = self._inactivity_request_rank(ctx.author)  # type: ignore[arg-type]
         if not rank:
             await ctx.send(
                 embed=discord.Embed(description="❌ You must be a staff member to use this command.", color=0xE74C3C),
@@ -1978,7 +1995,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         )
 
         # Determine who to ping based on the requester's rank
-        LOWER_RANKS = {"Trial Moderator", "Moderator", "Senior Moderator"}
+        LOWER_RANKS = {"Trial Moderator", "Moderator", "Senior Moderator", "Staff"}
         if rank in LOWER_RANKS:
             # Trial Mod / Mod / Senior Mod → ping Staff Management
             ping_ids = [self._cfg_int("STAFF_MANAGEMENT_ROLE_ID")]
