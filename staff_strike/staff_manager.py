@@ -38,6 +38,9 @@ import discord
 from discord import ui
 from discord.ext import commands, tasks
 
+from core import checks
+from core.models import PermissionLevel
+
 # ---------------------------------------------------------------------------
 # Constants & file paths
 # ---------------------------------------------------------------------------
@@ -401,8 +404,8 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     """
     Return a dict with action/user_id/user_tag/moderator/moderator_id/reason, or None.
 
-    Searches the embed title, author name, AND description so that Dyno embeds
-    are matched regardless of which field carries the action keyword.
+    Searches the embed title, author name, description, and explicitly named
+    action/type fields so Dyno embeds are matched across common log layouts.
     Returns None for lookup/list embeds (e.g. ?warnings, ?modlogs).
     """
     # Collect all text that might carry the action keyword
@@ -410,9 +413,17 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     author_str = (getattr(embed.author, "name", "") or "").lower()
     desc       = embed.description or ""
     desc_lower = desc.lower()
+    action_field_text = " ".join(
+        f"{field.name or ''} {field.value or ''}"
+        for field in embed.fields
+        if any(
+            keyword in (field.name or "").lower()
+            for keyword in ("action", "type", "punishment", "case type")
+        )
+    ).lower()
 
     # Combined searchable text — checked for keywords
-    full_text = f"{title_str} {author_str} {desc_lower}"
+    full_text = f"{title_str} {author_str} {desc_lower} {action_field_text}"
 
     # --- Exclude lookup / list embeds BEFORE action matching ---
     if _LOOKUP_PATTERNS.search(full_text):
@@ -500,15 +511,27 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
                     return f.value or ""
         return ""
 
+    # Resolve an explicitly identified moderator before using description
+    # mentions as a fallback for the target.
+    mod_field_raw = field_value(
+        "responsible moderator", "moderator", "mod", "staff", "by", "executor"
+    )
+    if mod_field_raw:
+        moderator_mention = re.search(r"<@!?(\d{17,20})>", mod_field_raw)
+        if moderator_mention:
+            result["moderator_id"] = int(moderator_mention.group(1))
+    if not result["moderator_id"]:
+        moderator_line = re.search(
+            r"(?:Responsible\s+)?Moderator[:\s]+<@!?(\d{17,20})>",
+            desc,
+            re.IGNORECASE,
+        )
+        if moderator_line:
+            result["moderator_id"] = int(moderator_line.group(1))
+
     # --- User ---
     user_raw = field_value("user", "member", "target")
-    # Also check description for user mentions if no field found
-    if not user_raw:
-        # Look for first mention in description that isn't obviously the moderator line
-        m_desc_user = re.search(r"<@!?(\d{17,20})>", desc)
-        if m_desc_user:
-            result["user_id"] = int(m_desc_user.group(1))
-    else:
+    if user_raw:
         # Field may contain "Username (123456789)" or just a mention
         mention_in_field = re.search(r"<@!?(\d{17,20})>", user_raw)
         if mention_in_field:
@@ -523,24 +546,39 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
             tag_part = re.sub(r"\s*\(\d+\)\s*$", "", cleaned).strip()
             if tag_part:
                 result["user_tag"] = tag_part
-
-    if not result["user_id"]:
+    else:
+        # Prefer an explicitly labelled target in the description over a loose
+        # mention. Dyno descriptions may mention the moderator before the user.
         for pat in [
             r"User:\s*<@!?(\d{17,20})>",
             r"\*\*User:\*\*\s*<@!?(\d{17,20})>",
             r"User:\s*(\d{17,20})",
+            r"(?:Member|Target):\s*<@!?(\d{17,20})>",
+            r"\*\*(?:Member|Target):\*\*\s*<@!?(\d{17,20})>",
+            r"(?:Member|Target):\s*(\d{17,20})",
         ]:
             m2 = re.search(pat, desc, re.IGNORECASE)
             if m2:
                 result["user_id"] = int(m2.group(1))
                 break
 
+        # Use a description mention only if it is not the identified moderator.
+        # If several candidates remain, leave the target unmatched rather than
+        # assigning a case to the wrong person.
+        if not result["user_id"]:
+            all_mentions = list(dict.fromkeys(re.findall(r"<@!?(\d{17,20})>", desc)))
+            candidates = [
+                mention
+                for mention in all_mentions
+                if mention != str(result.get("moderator_id") or "")
+            ]
+            if len(candidates) == 1:
+                result["user_id"] = int(candidates[0])
+            elif not result["moderator_id"] and len(all_mentions) == 1:
+                result["user_id"] = int(all_mentions[0])
+
     # --- Moderator ---
     # Try every plausible Dyno field name for the moderator.
-    mod_field_raw = field_value(
-        "responsible moderator", "moderator", "mod", "staff", "by", "executor"
-    )
-
     # Priority 1: mention in a dedicated moderator field
     if mod_field_raw:
         m_mention = re.search(r"<@!?(\d{17,20})>", mod_field_raw)
@@ -1881,7 +1919,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     # ------------------------------------------------------------------ #
 
     @commands.command(name="inactivityreq", aliases=["loa", "loareq"])
-    @commands.check(staff_moderator_check)
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def inactivity_request(
         self, ctx: commands.Context, duration: str, *, reason: str
     ) -> None:
@@ -1893,13 +1931,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
           !inactivityreq 2w Family emergency
           !inactivityreq 1d12h Mental health break
         """
-        rank = self._member_rank(ctx.author)  # type: ignore[arg-type]
-        if not rank:
-            await ctx.send(
-                embed=discord.Embed(description="❌ You must be a staff member to use this command.", color=0xE74C3C),
-                delete_after=10,
-            )
-            return
+        rank = self._member_rank(ctx.author) or "Modmail Moderator+"
 
         td = parse_duration(duration)
         if td is None:
