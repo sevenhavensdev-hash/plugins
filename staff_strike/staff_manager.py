@@ -38,6 +38,9 @@ import discord
 from discord import ui
 from discord.ext import commands, tasks
 
+from core import checks
+from core.models import PermissionLevel
+
 # ---------------------------------------------------------------------------
 # Constants & file paths
 # ---------------------------------------------------------------------------
@@ -868,15 +871,6 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
             rid = role_map.get(rank)
             if rid and rid in member_role_ids:
                 return rank
-        return None
-
-    def _inactivity_request_rank(self, member: discord.Member) -> Optional[str]:
-        """Return the member's configured rank or the explicit staff allowlist rank."""
-        rank = self._member_rank(member)
-        if rank:
-            return rank
-        if member.id in _configured_ids("STAFF_IDS"):
-            return "Staff"
         return None
 
     def _next_rank(self, current: str) -> Optional[str]:
@@ -1925,7 +1919,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     # ------------------------------------------------------------------ #
 
     @commands.command(name="inactivityreq", aliases=["loa", "loareq"])
-    @commands.check(staff_moderator_check)
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def inactivity_request(
         self, ctx: commands.Context, duration: str, *, reason: str
     ) -> None:
@@ -1937,13 +1931,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
           !inactivityreq 2w Family emergency
           !inactivityreq 1d12h Mental health break
         """
-        rank = self._inactivity_request_rank(ctx.author)  # type: ignore[arg-type]
-        if not rank:
-            await ctx.send(
-                embed=discord.Embed(description="❌ You must be a staff member to use this command.", color=0xE74C3C),
-                delete_after=10,
-            )
-            return
+        rank = self._member_rank(ctx.author) or "Modmail Moderator+"
 
         td = parse_duration(duration)
         if td is None:
@@ -1995,7 +1983,13 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         )
 
         # Determine who to ping based on the requester's rank
-        LOWER_RANKS = {"Trial Moderator", "Moderator", "Senior Moderator", "Staff"}
+        LOWER_RANKS = {
+            "Trial Moderator",
+            "Moderator",
+            "Senior Moderator",
+            "Staff",
+            "Modmail Moderator+",
+        }
         if rank in LOWER_RANKS:
             # Trial Mod / Mod / Senior Mod → ping Staff Management
             ping_ids = [self._cfg_int("STAFF_MANAGEMENT_ROLE_ID")]
