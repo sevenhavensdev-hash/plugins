@@ -666,7 +666,8 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         return [
             record
             for record in self._records_for(user_id)
-            if record.get("action") == "warn"
+            if str(record.get("action", "")).strip().casefold()
+            in {"warn", "warning", "warned"}
         ]
 
     def _base_record(
