@@ -2305,10 +2305,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await self._post_mod_action(ch, data, ctx.message)
         await ctx.message.add_reaction("✅")
 
-    @commands.command(name="transferstaffstats")
-    @commands.check(staff_admin_check)
-    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
-    async def transfer_staff_stats(self, ctx: commands.Context) -> None:
+    async def _transfer_staff_stats_impl(self, ctx: commands.Context) -> None:
         """Import Staff Strike action logs into the weekly/all-time stat store."""
         channel_id = self._cfg_int("MOD_ACTION_LOG_CHANNEL")
         if not channel_id:
@@ -2413,6 +2410,12 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 "`staffstats` and `staffleaderboard week/alltime` use the same data."
             )
         )
+
+    @commands.command(name="transferstaffstats")
+    @commands.check(staff_admin_check)
+    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
+    async def transfer_staff_stats(self, ctx: commands.Context) -> None:
+        await self._transfer_staff_stats_impl(ctx)
 
     @commands.command(name="staffstats")
     @commands.check(staff_moderator_check)
@@ -2922,9 +2925,33 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         await ctx.send(embed=lb_pages[0], view=view)
 
 
+class StaffStatsTransferCog(commands.Cog, name="Staff Stats Transfer"):
+    """Expose the import command even when an older Staff Manager cog is loaded."""
+
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+
+    @commands.command(name="transferstaffstats")
+    @commands.check(staff_admin_check)
+    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
+    async def transfer_staff_stats(self, ctx: commands.Context) -> None:
+        handler = StaffManagerCog(self.bot)
+        await handler._transfer_staff_stats_impl(ctx)
+
+
 # ---------------------------------------------------------------------------
 # Plugin entry point
 # ---------------------------------------------------------------------------
 
 async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(StaffManagerCog(bot))
+    if bot.get_cog("Staff Manager") is None:
+        await bot.add_cog(StaffManagerCog(bot))
+    if (
+        bot.get_command("transferstaffstats") is None
+        and bot.get_cog("Staff Stats Transfer") is None
+    ):
+        await bot.add_cog(StaffStatsTransferCog(bot))
+    if bot.get_command("transferstaffstats") is None:
+        raise RuntimeError(
+            "Staff Manager loaded without registering transferstaffstats."
+        )
