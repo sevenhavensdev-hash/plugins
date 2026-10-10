@@ -198,6 +198,34 @@ def _reason_text(reason: str) -> str:
     return cleaned[:1000] if cleaned else "No reason provided."
 
 
+def _move_history_record(history: Dict[str, List[dict]], updated_record: dict) -> bool:
+    """Move an existing imported record to its corrected user key by source log key."""
+    source_key = str(updated_record.get("source_log_key") or "")
+    if not source_key:
+        return False
+
+    current_record = None
+    for current_user_id, current_records in list(history.items()):
+        for index, current in enumerate(current_records):
+            if str(current.get("source_log_key") or "") == source_key:
+                current_record = current_records.pop(index)
+                if not current_records:
+                    history.pop(current_user_id, None)
+                break
+        if current_record is not None:
+            break
+
+    if current_record is None:
+        return False
+
+    merged_record = {**current_record, **updated_record}
+    merged_record["case_id"] = current_record.get(
+        "case_id", updated_record.get("case_id", "")
+    )
+    history.setdefault(str(merged_record["user_id"]), []).append(merged_record)
+    return True
+
+
 def _plain_embed_text(embed: discord.Embed) -> str:
     """Render an embed as message text when the channel disallows embeds."""
     parts = [embed.title] if embed.title else []
@@ -979,8 +1007,10 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
     async def _before_expiry(self) -> None:
         await self.bot.wait_until_ready()
 
-    async def _transfer_dyno_history(self, ctx: commands.Context) -> None:
-        """Import recognized Dyno moderation actions into user histories."""
+    async def _transfer_dyno_history(
+        self, ctx: commands.Context, *, repair: bool = False
+    ) -> None:
+        """Import new Dyno actions, or repair existing imports in place."""
         if not ctx.guild:
             return
 
@@ -1052,26 +1082,33 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
             return
 
         initial_history = self._history()
-        imported_keys = {
-            str(record.get("source_log_key"))
+        existing_records = {
+            str(record.get("source_log_key")): record
             for records in initial_history.values()
             for record in records
             if record.get("source_log_key")
         }
         pending_records: list[dict] = []
+        pending_updates: list[dict] = []
         counters = {
             "scanned": 0,
             "imported": 0,
+            "repaired": 0,
             "duplicates": 0,
             "unrecognized": 0,
             "unmatched_targets": 0,
             "non_dyno": 0,
         }
         started_embed = discord.Embed(
-                title="Dyno history transfer started",
-                description=f"Reading moderation logs from {channel.mention} oldest first.",
-                color=0x5865F2,
-                timestamp=_now(),
+            title="Dyno history repair started" if repair else "Dyno history transfer started",
+            description=(
+                f"Re-reading moderation logs from {channel.mention} oldest first to "
+                "repair existing imports."
+                if repair
+                else f"Reading moderation logs from {channel.mention} oldest first."
+            ),
+            color=0x5865F2,
+            timestamp=_now(),
         )
         status = await _send_embed_or_text(ctx, started_embed)
 
@@ -1081,7 +1118,8 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
                 description=(
                     f"Messages scanned: **{counters['scanned']:,}**\n"
                     f"Imported: **{counters['imported']:,}** • "
-                    f"Already imported: **{counters['duplicates']:,}**\n"
+                    f"Repaired: **{counters['repaired']:,}** • "
+                    f"Already imported/unchanged: **{counters['duplicates']:,}**\n"
                     f"Non-Dyno messages ignored: **{counters['non_dyno']:,}** • "
                     f"Other/unrecognized logs ignored: **{counters['unrecognized']:,}**\n"
                     f"Could not match a target user: **{counters['unmatched_targets']:,}**"
@@ -1098,10 +1136,16 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
                 await status.edit(content=_plain_embed_text(embed), embed=None)
 
         def flush_pending_records() -> None:
-            """Merge each checkpoint into the latest on-disk history."""
-            if not pending_records:
+            """Merge imports and repairs into the latest on-disk history."""
+            if not pending_records and not pending_updates:
                 return
             latest_history = self._history()
+
+            for updated_record in pending_updates:
+                # Do not resurrect a record that was removed while a long repair
+                # scan was running.
+                _move_history_record(latest_history, updated_record)
+
             next_case_number = int(self._next_case_id().split("-", 1)[1])
             for pending_record in pending_records:
                 pending_record["case_id"] = f"SS-{next_case_number:06d}"
@@ -1111,6 +1155,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
                 next_case_number += 1
             _save(HISTORY_FILE, latest_history)
             pending_records.clear()
+            pending_updates.clear()
 
         try:
             async for message in channel.history(limit=None, oldest_first=True):
@@ -1132,7 +1177,8 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
                         continue
 
                     source_key = f"{message.id}:{embed_index}"
-                    if source_key in imported_keys:
+                    existing_entry = existing_records.get(source_key)
+                    if existing_entry and not repair:
                         counters["duplicates"] += 1
                         continue
 
@@ -1217,8 +1263,34 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
                         "source_log_url": message.jump_url,
                         "imported_from": "Dyno",
                     }
+
+                    if existing_entry:
+                        previous_record = existing_entry
+                        repair_fields = [
+                            "action",
+                            "user_id",
+                            "user_tag",
+                            "reason",
+                        ]
+                        if str(record["moderator_id"]) != "0":
+                            repair_fields.extend(("moderator_id", "moderator_tag"))
+
+                        if any(
+                            previous_record.get(field) != record.get(field)
+                            for field in repair_fields
+                        ):
+                            updated_record = dict(previous_record)
+                            for field in repair_fields:
+                                updated_record[field] = record[field]
+                            pending_updates.append(updated_record)
+                            counters["repaired"] += 1
+                            if counters["repaired"] % 25 == 0:
+                                flush_pending_records()
+                        else:
+                            counters["duplicates"] += 1
+                        continue
+
                     pending_records.append(record)
-                    imported_keys.add(source_key)
                     counters["imported"] += 1
 
                     # Checkpoint the JSON store periodically so a long transfer
@@ -1239,7 +1311,10 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
             return
 
         flush_pending_records()
-        await update_status("Dyno history transfer complete", 0x2ECC71)
+        await update_status(
+            "Dyno history repair complete" if repair else "Dyno history transfer complete",
+            0x2ECC71,
+        )
 
     @commands.command(name="history")
     @commands.check(staff_moderator_check)
@@ -1623,18 +1698,37 @@ class DynoTransferCog(commands.Cog, name="Staff Strike Dyno Transfer"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._moderation = ModerationCog(bot)
+
+    def _moderation_cog(self):
+        return self.bot.get_cog("Staff Strike Moderation")
 
     @commands.command(name="transferdyno")
     @commands.check(staff_management_check)
     @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
-    async def transfer_dyno_history(self, ctx: commands.Context) -> None:
-        await self._moderation._transfer_dyno_history(ctx)
+    async def transfer_dyno_history(
+        self, ctx: commands.Context, mode: str = "import"
+    ) -> None:
+        mode = mode.strip().casefold()
+        if mode not in {"import", "repair"}:
+            await ctx.send(
+                "Use `.transferdyno` to import new cases or "
+                "`.transferdyno repair` to update existing Dyno imports in place."
+            )
+            return
+
+        moderation = self._moderation_cog()
+        if moderation is None:
+            raise commands.CommandError("Staff Strike Moderation is not loaded.")
+        await moderation._transfer_dyno_history(ctx, repair=mode == "repair")
 
     async def cog_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
-        await self._moderation.cog_command_error(ctx, error)
+        moderation = self._moderation_cog()
+        if moderation is not None:
+            await moderation.cog_command_error(ctx, error)
+        else:
+            await ctx.send("Staff Strike Moderation is not loaded.")
 
 
 async def setup(bot: commands.Bot) -> None:
