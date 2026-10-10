@@ -38,6 +38,9 @@ import discord
 from discord import ui
 from discord.ext import commands, tasks
 
+from core import checks
+from core.models import PermissionLevel
+
 # ---------------------------------------------------------------------------
 # Constants & file paths
 # ---------------------------------------------------------------------------
@@ -215,24 +218,62 @@ def _save(path: str, data: dict) -> None:
 
 
 def record_staff_action(
-    moderator_id: int, action: str, link: Optional[str] = None
-) -> None:
+    moderator_id: int,
+    action: str,
+    link: Optional[str] = None,
+    occurred_at: Optional[datetime] = None,
+) -> bool:
     """Record an action for staffstats/leaderboard.
 
     This module-level helper is shared by the moderation cog so actions made
     by this bot use exactly the same counters and evidence links as the staff
     manager.  Ticket-close tracking also uses this store.
     """
+    imported, _ = _record_staff_actions(
+        [(moderator_id, action, link, occurred_at)]
+    )
+    return imported > 0
+
+
+def _record_staff_actions(
+    records: List[Tuple[int, str, Optional[str], Optional[datetime]]]
+) -> Tuple[int, int]:
+    """Store a batch of actions in the same week buckets used by staffstats."""
     data = _load(MOD_ACTIONS_FILE)
-    week = datetime.now(timezone.utc).strftime("%Y-W%W")
-    uid = str(moderator_id)
-    data.setdefault(week, {}).setdefault(uid, {})
-    data[week][uid][action] = data[week][uid].get(action, 0) + 1
-    if link:
-        links_key = f"{action}_links"
-        data[week][uid].setdefault(links_key, [])
-        data[week][uid][links_key].append(link)
-    _save(MOD_ACTIONS_FILE, data)
+    known_links = set()
+    for week_data in data.values():
+        if not isinstance(week_data, dict):
+            continue
+        for user_data in week_data.values():
+            if not isinstance(user_data, dict):
+                continue
+            for key, value in user_data.items():
+                if key.endswith("_links") and isinstance(value, list):
+                    known_links.update(str(item) for item in value)
+
+    imported = 0
+    duplicates = 0
+    for moderator_id, action, link, occurred_at in records:
+        if link and link in known_links:
+            duplicates += 1
+            continue
+
+        when = occurred_at or datetime.now(timezone.utc)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        week = when.astimezone(timezone.utc).strftime("%Y-W%W")
+        user_data = data.setdefault(week, {}).setdefault(str(moderator_id), {})
+        current = user_data.get(action, 0)
+        user_data[action] = (current if isinstance(current, int) else 0) + 1
+        if link:
+            links_key = f"{action}_links"
+            user_data.setdefault(links_key, []).append(link)
+            known_links.add(link)
+        imported += 1
+
+    if imported:
+        _save(MOD_ACTIONS_FILE, data)
+    return imported, duplicates
 
 
 def remove_staff_action(
@@ -267,6 +308,80 @@ def remove_staff_action(
         return
 
     _save(MOD_ACTIONS_FILE, data)
+
+
+def _normalize_staff_action(value: str) -> Optional[str]:
+    """Map the action wording used in log embeds to a staff-stat action key."""
+    cleaned = re.sub(r"[`*_~]", "", value).strip().casefold()
+    aliases = {
+        "warn": "warn",
+        "warned": "warn",
+        "warning": "warn",
+        "warnings": "warn",
+        "mute": "mute",
+        "muted": "mute",
+        "timeout": "mute",
+        "timeouts": "mute",
+        "mutes": "mute",
+        "kick": "kick",
+        "kicked": "kick",
+        "kicks": "kick",
+        "ban": "ban",
+        "banned": "ban",
+        "bans": "ban",
+        "softban": "softban",
+        "softbanned": "softban",
+        "softbans": "softban",
+        "ticket_close": "ticket_close",
+        "ticket closed": "ticket_close",
+        "tickets closed": "ticket_close",
+    }
+    action = aliases.get(cleaned)
+    return action if action in ACTION_LABELS else None
+
+
+def _parse_staff_stats_log(
+    message: discord.Message, embed: discord.Embed, bot_user_id: int
+) -> Optional[Tuple[int, str, Optional[str], datetime]]:
+    """Extract one Staff Strike action log for the stats importer."""
+    if message.author.id != bot_user_id:
+        return None
+    if "moderation action" not in (embed.title or "").casefold():
+        return None
+
+    footer = embed.footer.text or ""
+    action_match = re.search(r"\bact:([a-z_]+)\b", footer, re.IGNORECASE)
+    mod_match = re.search(r"\bmod:(\d{17,20})\b", footer, re.IGNORECASE)
+    action = _normalize_staff_action(action_match.group(1)) if action_match else None
+    moderator_id = int(mod_match.group(1)) if mod_match else None
+
+    if not action:
+        title_action = (embed.title or "").rsplit("—", 1)[-1].strip()
+        action = _normalize_staff_action(title_action)
+    if not action:
+        for field in embed.fields:
+            if any(word in (field.name or "").casefold() for word in ("action", "type")):
+                action = _normalize_staff_action(field.value or "")
+                if action:
+                    break
+
+    if not moderator_id:
+        for field in embed.fields:
+            if "moderator" not in (field.name or "").casefold():
+                continue
+            mention = re.search(r"<@!?(\d{17,20})>", field.value or "")
+            raw_id = mention.group(1) if mention else (field.value or "").strip()
+            if re.fullmatch(r"\d{17,20}", raw_id):
+                moderator_id = int(raw_id)
+                break
+
+    if not action or not moderator_id:
+        return None
+
+    occurred_at = embed.timestamp or message.created_at
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    return moderator_id, action, message.jump_url, occurred_at
 
 
 # ---------------------------------------------------------------------------
@@ -401,8 +516,8 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     """
     Return a dict with action/user_id/user_tag/moderator/moderator_id/reason, or None.
 
-    Searches the embed title, author name, AND description so that Dyno embeds
-    are matched regardless of which field carries the action keyword.
+    Searches the embed title, author name, description, and explicitly named
+    action/type fields so Dyno embeds are matched across common log layouts.
     Returns None for lookup/list embeds (e.g. ?warnings, ?modlogs).
     """
     # Collect all text that might carry the action keyword
@@ -410,9 +525,17 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
     author_str = (getattr(embed.author, "name", "") or "").lower()
     desc       = embed.description or ""
     desc_lower = desc.lower()
+    action_field_text = " ".join(
+        f"{field.name or ''} {field.value or ''}"
+        for field in embed.fields
+        if any(
+            keyword in (field.name or "").lower()
+            for keyword in ("action", "type", "punishment", "case type")
+        )
+    ).lower()
 
     # Combined searchable text — checked for keywords
-    full_text = f"{title_str} {author_str} {desc_lower}"
+    full_text = f"{title_str} {author_str} {desc_lower} {action_field_text}"
 
     # --- Exclude lookup / list embeds BEFORE action matching ---
     if _LOOKUP_PATTERNS.search(full_text):
@@ -500,15 +623,27 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
                     return f.value or ""
         return ""
 
+    # Resolve an explicitly identified moderator before using description
+    # mentions as a fallback for the target.
+    mod_field_raw = field_value(
+        "responsible moderator", "moderator", "mod", "staff", "by", "executor"
+    )
+    if mod_field_raw:
+        moderator_mention = re.search(r"<@!?(\d{17,20})>", mod_field_raw)
+        if moderator_mention:
+            result["moderator_id"] = int(moderator_mention.group(1))
+    if not result["moderator_id"]:
+        moderator_line = re.search(
+            r"(?:Responsible\s+)?Moderator[:\s]+<@!?(\d{17,20})>",
+            desc,
+            re.IGNORECASE,
+        )
+        if moderator_line:
+            result["moderator_id"] = int(moderator_line.group(1))
+
     # --- User ---
     user_raw = field_value("user", "member", "target")
-    # Also check description for user mentions if no field found
-    if not user_raw:
-        # Look for first mention in description that isn't obviously the moderator line
-        m_desc_user = re.search(r"<@!?(\d{17,20})>", desc)
-        if m_desc_user:
-            result["user_id"] = int(m_desc_user.group(1))
-    else:
+    if user_raw:
         # Field may contain "Username (123456789)" or just a mention
         mention_in_field = re.search(r"<@!?(\d{17,20})>", user_raw)
         if mention_in_field:
@@ -523,24 +658,39 @@ def _parse_dyno_embed(embed: discord.Embed) -> Optional[dict]:
             tag_part = re.sub(r"\s*\(\d+\)\s*$", "", cleaned).strip()
             if tag_part:
                 result["user_tag"] = tag_part
-
-    if not result["user_id"]:
+    else:
+        # Prefer an explicitly labelled target in the description over a loose
+        # mention. Dyno descriptions may mention the moderator before the user.
         for pat in [
             r"User:\s*<@!?(\d{17,20})>",
             r"\*\*User:\*\*\s*<@!?(\d{17,20})>",
             r"User:\s*(\d{17,20})",
+            r"(?:Member|Target):\s*<@!?(\d{17,20})>",
+            r"\*\*(?:Member|Target):\*\*\s*<@!?(\d{17,20})>",
+            r"(?:Member|Target):\s*(\d{17,20})",
         ]:
             m2 = re.search(pat, desc, re.IGNORECASE)
             if m2:
                 result["user_id"] = int(m2.group(1))
                 break
 
+        # Use a description mention only if it is not the identified moderator.
+        # If several candidates remain, leave the target unmatched rather than
+        # assigning a case to the wrong person.
+        if not result["user_id"]:
+            all_mentions = list(dict.fromkeys(re.findall(r"<@!?(\d{17,20})>", desc)))
+            candidates = [
+                mention
+                for mention in all_mentions
+                if mention != str(result.get("moderator_id") or "")
+            ]
+            if len(candidates) == 1:
+                result["user_id"] = int(candidates[0])
+            elif not result["moderator_id"] and len(all_mentions) == 1:
+                result["user_id"] = int(all_mentions[0])
+
     # --- Moderator ---
     # Try every plausible Dyno field name for the moderator.
-    mod_field_raw = field_value(
-        "responsible moderator", "moderator", "mod", "staff", "by", "executor"
-    )
-
     # Priority 1: mention in a dedicated moderator field
     if mod_field_raw:
         m_mention = re.search(r"<@!?(\d{17,20})>", mod_field_raw)
@@ -1881,7 +2031,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     # ------------------------------------------------------------------ #
 
     @commands.command(name="inactivityreq", aliases=["loa", "loareq"])
-    @commands.check(staff_moderator_check)
+    @checks.has_permissions(PermissionLevel.MODERATOR)
     async def inactivity_request(
         self, ctx: commands.Context, duration: str, *, reason: str
     ) -> None:
@@ -1893,13 +2043,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
           !inactivityreq 2w Family emergency
           !inactivityreq 1d12h Mental health break
         """
-        rank = self._member_rank(ctx.author)  # type: ignore[arg-type]
-        if not rank:
-            await ctx.send(
-                embed=discord.Embed(description="❌ You must be a staff member to use this command.", color=0xE74C3C),
-                delete_after=10,
-            )
-            return
+        rank = self._member_rank(ctx.author) or "Modmail Moderator+"
 
         td = parse_duration(duration)
         if td is None:
@@ -2154,6 +2298,116 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
         }
         await self._post_mod_action(ch, data, ctx.message)
         await ctx.message.add_reaction("✅")
+
+    @commands.command(name="transferstaffstats")
+    @commands.check(staff_admin_check)
+    @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
+    async def transfer_staff_stats(self, ctx: commands.Context) -> None:
+        """Import Staff Strike action logs into the weekly/all-time stat store."""
+        channel_id = self._cfg_int("MOD_ACTION_LOG_CHANNEL")
+        if not channel_id:
+            await ctx.send("❌ The `MOD_ACTION_LOG_CHANNEL` setting is missing or invalid.")
+            return
+        channel = self._channel("MOD_ACTION_LOG_CHANNEL")
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)  # type: ignore[assignment]
+            except discord.HTTPException:
+                await ctx.send("❌ I could not access the configured mod action log channel.")
+                return
+        if not isinstance(channel, discord.TextChannel):
+            await ctx.send("❌ `MOD_ACTION_LOG_CHANNEL` must point to a text channel.")
+            return
+        if self.bot.user is None:
+            await ctx.send("❌ The bot user is not ready yet. Try again shortly.")
+            return
+
+        progress = await ctx.send(
+            f"Scanning {channel.mention} for Staff Strike moderation logs..."
+        )
+        counters = {"scanned": 0, "recognized": 0, "imported": 0, "duplicates": 0}
+        pending: List[Tuple[int, str, Optional[str], Optional[datetime]]] = []
+
+        def flush_pending() -> None:
+            if not pending:
+                return
+            imported, duplicates = _record_staff_actions(pending)
+            counters["imported"] += imported
+            counters["duplicates"] += duplicates
+            pending.clear()
+
+        try:
+            async for message in channel.history(limit=None, oldest_first=True):
+                counters["scanned"] += 1
+                for embed in message.embeds:
+                    record = _parse_staff_stats_log(message, embed, self.bot.user.id)
+                    if record:
+                        pending.append(record)
+                        counters["recognized"] += 1
+                        break
+
+                if len(pending) >= 100:
+                    flush_pending()
+
+                if counters["scanned"] % 500 == 0:
+                    try:
+                        await progress.edit(
+                            content=(
+                                f"Scanning {channel.mention}... "
+                                f"{counters['scanned']:,} messages checked, "
+                                f"{counters['imported']:,} imported so far."
+                            )
+                        )
+                    except discord.HTTPException:
+                        pass
+        except discord.Forbidden:
+            try:
+                flush_pending()
+            except OSError:
+                await progress.edit(content="❌ Could not save the partial staff-stat import.")
+                return
+            await progress.edit(
+                content=(
+                    "❌ I cannot read message history in the configured mod action log. "
+                    f"Partial result: {counters['imported']:,} imported."
+                )
+            )
+            return
+        except discord.HTTPException:
+            try:
+                flush_pending()
+            except OSError:
+                await progress.edit(content="❌ Could not save the partial staff-stat import.")
+                return
+            await progress.edit(
+                content=(
+                    "❌ Discord stopped the history scan. "
+                    f"Partial result: {counters['imported']:,} imported."
+                )
+            )
+            return
+        except OSError:
+            await progress.edit(content="❌ Could not save the staff-stat import.")
+            return
+
+        try:
+            flush_pending()
+        except OSError:
+            await progress.edit(content="❌ Could not save the staff-stat import.")
+            return
+
+        await progress.edit(
+            content=(
+                "✅ Staff-stat transfer complete.\n"
+                f"Messages scanned: **{counters['scanned']:,}** · "
+                f"Action logs found: **{counters['recognized']:,}** · "
+                f"Imported: **{counters['imported']:,}** · "
+                f"Already counted: **{counters['duplicates']:,}**\n"
+                "Each action was assigned to the week of its log timestamp, so "
+                "`staffstats` and `staffleaderboard week/alltime` use the same data."
+            )
+        )
+
 
     @commands.command(name="staffstats")
     @commands.check(staff_moderator_check)
