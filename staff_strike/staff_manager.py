@@ -2304,10 +2304,17 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
     @commands.max_concurrency(1, per=commands.BucketType.guild, wait=False)
     async def transfer_staff_stats(self, ctx: commands.Context) -> None:
         """Import Staff Strike action logs into the weekly/all-time stat store."""
-        channel = self._channel("MOD_ACTION_LOG_CHANNEL")
-        if channel is None:
+        channel_id = self._cfg_int("MOD_ACTION_LOG_CHANNEL")
+        if not channel_id:
             await ctx.send("❌ The `MOD_ACTION_LOG_CHANNEL` setting is missing or invalid.")
             return
+        channel = self._channel("MOD_ACTION_LOG_CHANNEL")
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)  # type: ignore[assignment]
+            except discord.HTTPException:
+                await ctx.send("❌ I could not access the configured mod action log channel.")
+                return
         if not isinstance(channel, discord.TextChannel):
             await ctx.send("❌ `MOD_ACTION_LOG_CHANNEL` must point to a text channel.")
             return
@@ -2400,6 +2407,7 @@ class StaffManagerCog(commands.Cog, name="Staff Manager"):
                 "`staffstats` and `staffleaderboard week/alltime` use the same data."
             )
         )
+
 
     @commands.command(name="staffstats")
     @commands.check(staff_moderator_check)
