@@ -864,7 +864,11 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         await ctx.send(embed=embed)
 
     async def _notify_user(self, target: discord.abc.User, record: dict) -> bool:
-        """Best-effort DM notification for a newly applied punishment."""
+        """Best-effort DM notification for a newly applied punishment.
+
+        The DM is intentionally anonymous: it never names or mentions the
+        staff member who issued the action.
+        """
         action = str(record.get("action", "moderation"))
         guild_id = str(record.get("guild_id", ""))
         guild = self.bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
@@ -896,11 +900,7 @@ class ModerationCog(commands.Cog, name="Staff Strike Moderation"):
         elif action in {"mute", "ban"}:
             embed.add_field(name="Duration", value="Permanent", inline=False)
         embed.add_field(name="Case", value=f"`{record['case_id']}`", inline=True)
-        embed.add_field(
-            name="Moderator",
-            value=f"<@{record['moderator_id']}>",
-            inline=True,
-        )
+        embed.add_field(name="Issued by", value="Staff Team", inline=True)
         embed.set_footer(text="Staff Strike moderation system")
 
         try:
